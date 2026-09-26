@@ -1,0 +1,2769 @@
+# Mini Core Banking Ledger Roadmap
+
+This roadmap breaks the portfolio project into practical development phases. Each phase should leave the project in a working, reviewable state with clear acceptance criteria.
+
+Use the checkboxes as the implementation tracker. Historical completed phases describe implementation tracking, not independent ownership evidence.
+
+## Current Feature Priorities (2026-09-05)
+
+**Next: Phase 22 — Funds Reservations.** Status: selected; preparation and design next; implementation not started. Phase numbers remain stable for existing links; execution priority is listed below.
+
+| Order | Feature | Roadmap phase | Dependency / first scope |
+| --- | --- | --- | --- |
+| 1 | Funds reservations | [22](#phase-22-funds-reservations) | Single currency per reservation; full capture, release, expiry |
+| 2 | Balance verification | [15](#phase-15-balance-recompute-and-variance-detection) | Verify posted balance and active reservations consistently |
+| 3 | Two-person adjustment approval | [18](#phase-18-approval-workflow-for-high-risk-operations) | Immutable request, different approver, one financial execution |
+| 4 | Scheduled transfers | [23](#phase-23-scheduled-transfers) | Durable execution identity and restart-safe worker |
+| 5 | Installment loans | [24](#phase-24-installment-loan-sandbox) | Receivable accounting design; principal-only first |
+| 6 | BNPL sandbox | [25](#phase-25-bnpl-sandbox) | Loan lifecycle plus merchant payment and refund rules |
+
+All six are future work. The existing reporting, event contracts, benchmarks, quality gates, and observability backlog remains available. New financial behavior requires Oracle-backed evidence; an unchecked plan or a unit-test pass is not runtime acceptance.
+
+For ownership, each increment should preserve the learner's initial design, the reviewed correction, a meaningful test result, and an unaided explanation. Publish feature claims only after the demonstrated behavior exists.
+
+## Planned Practice Extension: External Kafka Consumer
+
+Status: planned, implementation not started. This exercise follows ownership gate B12 and does not change the selected feature priorities above.
+
+Goal: Build a separately runnable transfer-notification consumer to demonstrate what happens after the ledger publishes an event. Keep it outside the ledger API's transaction and deployment lifecycle.
+
+### Scope And Evidence
+
+- [ ] Inspect the existing transfer event contract and identify its stable event ID, type, version, and required fields before designing the consumer.
+- [ ] Consume one existing transfer event type with a dedicated consumer group. First record a synthetic notification in a consumer-owned Oracle schema; do not send real email or SMS.
+- [ ] Save a durable processed-event record and the notification atomically in the consumer's Oracle transaction, with a unique event identity that prevents concurrent duplicates. Commit Kafka offsets only after durable processing succeeds.
+- [ ] Prove redelivery after a crash between Oracle commit and offset commit produces one notification. Rollback before Oracle commit must leave the event eligible for processing again.
+- [ ] Define bounded retry, invalid-payload handling, durable quarantine, and explicit replay. Do not acknowledge a failed event before either successful processing or durable quarantine under the chosen recovery policy.
+- [ ] Demonstrate that stopping the consumer does not block ledger transfer commits, then restart it and observe catch-up from retained Kafka events.
+- [ ] Test ordinary delivery, duplicate delivery, concurrent duplicates, database outage, crash recovery, malformed events, and replay using Kafka and Oracle. Record commands and actual output.
+- [ ] Explain Kafka offsets versus consumer database commits, retention limits, and why this does not provide exactly-once delivery. Adding a real notification provider later requires a separate strategy for its external side effect.
+- [ ] Provide a local demo and an unaided explanation, preserving initial design, assistance, corrections, and a delayed retest as ownership evidence.
+
+## Phase 0: Project Foundation
+
+Goal: Prepare the repository, runtime configuration, local infrastructure, and basic project conventions.
+
+### Steps
+
+- [x] Create Spring Boot API project in `banking-ledger-api`.
+- [x] Add Oracle JDBC and Flyway Oracle support.
+- [x] Add Docker Compose files for development and production.
+- [x] Add Oracle Database Free for local development.
+- [x] Add CloudBeaver browser database manager.
+- [x] Add Kafka for future ledger event publishing.
+- [x] Add `dev` and `prod` Spring profiles.
+- [x] Add environment examples and ignore files.
+- [x] Add root README with setup instructions.
+- [x] Create base package structure by feature:
+    - [x] `account`
+    - [x] `ledger`
+    - [x] `transfer`
+    - [x] `reconciliation`
+    - [x] `audit`
+    - [x] `outbox`
+    - [x] `security`
+    - [x] `shared`
+- [x] Add global API error response model.
+- [x] Add global exception handler.
+- [x] Add correlation ID request filter.
+- [x] Add basic logging configuration for correlation IDs.
+
+### Acceptance Criteria
+
+- [x] `docker compose -f compose.dev.yaml up -d` starts Oracle, Kafka, and CloudBeaver.
+- [x] CloudBeaver can connect to Oracle using the `ledger_dev` user.
+- [x] `./mvnw -DskipTests validate` succeeds.
+- [x] `./mvnw test` succeeds.
+- [x] The API starts locally with the `dev` profile.
+- [x] `/actuator/health` returns `UP`.
+- [x] Project setup is documented in `README.md`.
+
+## Phase 1: Database Schema And Core Domain Model
+
+Goal: Design the first version of the ledger database and model the most important financial concepts.
+
+### Steps
+
+- [x] Create Flyway migration folder:
+    - [x] `src/main/resources/db/migration`
+- [x] Add initial schema migration:
+    - [x] `customers`
+    - [x] `accounts`
+    - [x] `ledger_transactions`
+    - [x] `journal_entries`
+    - [x] `postings`
+    - [x] `transfer_requests`
+    - [x] `audit_events`
+    - [x] `idempotency_records`
+    - [x] `outbox_events`
+- [x] Add required constraints:
+    - [x] Unique account number.
+    - [x] Unique idempotency key per operation scope.
+    - [x] Foreign keys between postings, journal entries, transactions, and accounts.
+    - [x] Positive amount checks.
+    - [x] Valid debit/credit direction checks.
+    - [x] Version column for optimistic locking.
+- [x] Add required indexes:
+    - [x] Account transaction history by account and posted time.
+    - [x] Transaction lookup by external reference.
+    - [x] Idempotency key lookup.
+    - [x] Outbox status and retry lookup.
+- [x] Create Java enums:
+    - [x] `AccountType`
+    - [x] `AccountStatus`
+    - [x] `TransactionStatus`
+    - [x] `PostingDirection`
+    - [x] `OutboxStatus`
+- [x] Create currency and minor-unit amount representation:
+    - [x] Add a dedicated package for value objects:
+        - [x] `src/main/java/dev/kavrin/banking_ledger/shared/money`
+        - [x] `src/test/java/dev/kavrin/banking_ledger/shared/money`
+    - [x] Create a `CurrencyCode` value object:
+        - [x] Store the ISO-style code as a `String`.
+        - [x] Normalize input by trimming whitespace and converting to uppercase.
+        - [x] Reject null, blank, non-3-letter, and non-ASCII alphabetic values.
+        - [x] Add a `value()` accessor for persistence and DTO mapping.
+    - [x] Add persistence mapping guidance:
+        - [x] Keep database columns as `amount_minor number(19, 0)` and `currency_code char(3)`.
+        - [x] Map entities to primitive `amountMinor` and normalized `currencyCode` fields.
+        - [x] Do not use floating-point types for money.
+    - [x] Add unit tests for valid values:
+        - [x] Normalizes lowercase currency input.
+    - [x] Add unit tests for invalid values:
+        - [x] Rejects null currency.
+        - [x] Rejects blank currency.
+        - [x] Rejects currency codes with fewer or more than 3 characters.
+        - [x] Rejects currency codes with digits or symbols.
+- [x] Create JPA entities for the initial schema.
+- [x] Create Spring Data repositories.
+
+### Acceptance Criteria
+
+- [x] Flyway creates the schema from a clean Oracle database.
+- [x] JPA starts with `ddl-auto=validate` and no schema mismatch.
+- [x] Database constraints reject invalid postings and negative amounts.
+- [x] Unit tests verify money validation rules.
+
+## Phase 2: Account Service
+
+Goal: Implement account creation, account lookup, balance views, and account status validation.
+
+### Steps
+
+- [x] Prepare account package structure:
+    - [x] `account/api` for REST controllers.
+    - [x] `account/api/dto` for request and response DTOs.
+    - [x] `account/application` for account use-case orchestration.
+    - [x] `account/application/command` for write-side command objects.
+    - [x] `account/application/query` for read-side query objects.
+    - [x] `account/application/service` for application services.
+    - [x] `account/domain/policy` for account business rules.
+- [x] Add account DTOs:
+    - [x] Create `CreateAccountRequest`.
+    - [x] Add bean validation annotations:
+        - [x] `customerId` is required.
+        - [x] `accountNumber` is required and at most 34 characters.
+        - [x] `accountType` is required.
+        - [x] `currencyCode` is required and exactly 3 uppercase letters.
+    - [x] Create `AccountResponse`.
+    - [x] Include `id`, `customerId`, `accountNumber`, `accountType`, `accountCategory`, `status`, `currencyCode`, balances, and timestamps.
+    - [x] Create `BalanceResponse`.
+    - [x] Include account id, currency code, available balance minor, and ledger balance minor.
+    - [x] Create `AccountTransactionSummaryResponse`.
+    - [x] Include posting id, ledger transaction id, direction, amount minor, currency code, description, and posted time.
+- [x] Add account command/query objects:
+    - [x] Create `CreateAccountCommand`.
+    - [x] Create `GetAccountByIdQuery`.
+    - [x] Create `GetAccountByNumberQuery`.
+    - [x] Create `GetAccountBalanceQuery`.
+    - [x] Create `GetAccountTransactionsQuery`.
+- [x] Add repository lookup methods:
+    - [x] `existsByAccountNumber`.
+    - [x] `findByAccountNumber`.
+    - [x] Account transaction history query through postings by account id and posted time.
+- [x] Implement account creation use case:
+    - [x] Load the owning customer.
+    - [x] Reject duplicate account numbers.
+    - [x] Validate account type and account category.
+    - [x] Validate and normalize currency code using `CurrencyCode`.
+    - [x] Create accounts with `ACTIVE` status.
+    - [x] Initialize available and ledger balances to zero.
+    - [x] Save the account inside a transaction.
+    - [x] Return `AccountResponse`.
+- [x] Implement account lookup use cases:
+    - [x] Lookup by account id.
+    - [x] Lookup by account number.
+    - [x] Return not-found errors through the shared exception model.
+- [x] Implement balance query use case:
+    - [x] Load account by id.
+    - [x] Return cached available and ledger balances.
+    - [x] Preserve minor-unit money representation in the response.
+- [x] Implement account transaction history use case:
+    - [x] Query postings for the account ordered by `posted_at` descending.
+    - [x] Support pagination with `Pageable`.
+    - [x] Support optional `from` and `to` posted-time filters.
+    - [x] Return transaction summary DTOs.
+- [x] Add account status rules:
+    - [x] Create an account status policy class.
+    - [x] Active accounts can debit and credit.
+    - [x] Frozen accounts cannot debit.
+    - [x] Frozen accounts can receive credits unless the policy explicitly forbids it.
+    - [x] Closed accounts cannot debit.
+    - [x] Closed accounts cannot receive credits unless explicitly allowed by a future operational workflow.
+- [x] Add validation for account creation:
+    - [x] Reject customer accounts with internal-only account types if that rule is selected.
+    - [x] Reject invalid currency codes before persistence.
+    - [x] Reject blank account numbers.
+    - [x] Reject account numbers longer than the schema limit.
+- [x] Add audit event creation for account lifecycle operations:
+    - [x] Write an audit event after account creation.
+    - [x] Include entity type `ACCOUNT`.
+    - [x] Include account id as entity id.
+    - [x] Include actor type and correlation id when available.
+    - [x] Store audit event in the same transaction as account creation.
+- [x] Add account REST controller:
+    - [x] `POST /api/v1/accounts`.
+    - [x] `GET /api/v1/accounts/{accountId}`.
+    - [x] `GET /api/v1/accounts/by-number/{accountNumber}`.
+    - [x] `GET /api/v1/accounts/{accountId}/balance`.
+    - [x] `GET /api/v1/accounts/{accountId}/transactions`.
+- [x] Add account service tests:
+    - [x] Successful account creation.
+    - [x] Duplicate account number is rejected.
+    - [x] Missing customer is rejected.
+    - [x] Invalid currency is rejected.
+    - [x] Lookup by id returns account.
+    - [x] Lookup by account number returns account.
+    - [x] Missing account returns not-found error.
+    - [x] Balance query returns cached balances.
+    - [x] Status policy allows active debit and credit.
+    - [x] Status policy rejects frozen/closed debits.
+- [x] Add account API tests:
+    - [x] Create account returns `201`.
+    - [x] Invalid request returns structured validation error.
+    - [x] Get account returns account response.
+    - [x] Get balance returns balance response.
+    - [x] Get transaction history returns a paginated response.
+- [x] Add account persistence tests:
+    - [x] Account number uniqueness is enforced.
+    - [x] Account currency check rejects invalid currency values.
+    - [x] Account balance checks reject negative cached balances.
+
+### Acceptance Criteria
+
+- [x] `POST /api/v1/accounts` creates an account.
+- [x] Duplicate account creation does not create a second account.
+- [x] `GET /api/v1/accounts/{accountId}` returns account details.
+- [x] `GET /api/v1/accounts/by-number/{accountNumber}` returns account details.
+- [x] `GET /api/v1/accounts/{accountId}/balance` returns current balance.
+- [x] `GET /api/v1/accounts/{accountId}/transactions` returns paginated history.
+- [x] Invalid account creation requests return structured validation errors.
+- [x] Account lifecycle changes create audit events.
+- [x] Account service tests cover status and validation rules.
+- [x] Account API tests cover success and validation failure paths.
+- [x] Account persistence tests prove schema constraints reject invalid account rows.
+
+## Phase 3: Ledger Posting Engine
+
+Goal: Implement double-entry journal creation and enforce financial invariants before data is persisted.
+
+### Steps
+
+- [x] Prepare package structure:
+    - [x] Add `ledger.application.command` for posting input commands.
+    - [x] Add `ledger.application.service` for ledger posting use cases.
+    - [x] Add `ledger.domain.factory` for journal and posting construction.
+    - [x] Add `ledger.domain.policy` for double-entry validation rules.
+    - [x] Add package-level tests under `ledger.domain` and `ledger.application` as implementation begins.
+- [x] Create immutable ledger command objects:
+    - [x] Add `PostLedgerTransactionCommand`.
+    - [x] Add `PostingLineCommand`.
+    - [x] Include `externalReference`, `transactionType`, `currencyCode`, `amountMinor`, `description`, `actorType`, and `correlationId`.
+    - [x] Include account id, posting direction, amount, and currency on each posting line.
+    - [x] Validate required command fields before domain construction.
+- [x] Create ledger domain objects:
+    - [x] Add `LedgerTransaction`.
+    - [x] Add `JournalEntry`.
+    - [x] Add `Posting`.
+    - [x] Keep domain objects persistence-free.
+    - [x] Represent amounts using integer minor units and explicit currency code.
+    - [x] Expose read-only posting collections from `JournalEntry`.
+- [x] Implement posting validation policy:
+    - [x] Reject fewer than two postings.
+    - [x] Reject entries without at least one debit and one credit.
+    - [x] Reject zero or negative posting amounts.
+    - [x] Reject mixed posting currencies.
+    - [x] Reject posting currency that differs from the transaction currency.
+    - [x] Reject total debit that differs from total credit.
+    - [x] Reject a journal total that differs from the transaction amount.
+- [x] Implement journal entry factory:
+    - [x] Accept `PostLedgerTransactionCommand`.
+    - [x] Normalize currency codes through `CurrencyCode`.
+    - [x] Build one `LedgerTransaction`.
+    - [x] Build one `JournalEntry`.
+    - [x] Build all `Posting` lines.
+    - [x] Run posting validation before returning the journal entry.
+    - [x] Return a domain object graph without touching repositories.
+- [x] Map domain objects to persistence entities:
+    - [x] Convert `LedgerTransaction` to `LedgerTransactionEntity`.
+    - [x] Convert `JournalEntry` to `JournalEntryEntity`.
+    - [x] Convert each `Posting` to `PostingEntity`.
+    - [x] Resolve `AccountEntity` references for posting accounts.
+    - [x] Set `postedAt` once and reuse it across transaction, journal entry, and postings.
+- [x] Implement `PostLedgerTransactionUseCase`:
+    - [x] Annotate the public handler with `@Transactional`.
+    - [x] Validate duplicate `externalReference` before insert when present.
+    - [x] Load all posting accounts.
+    - [x] Reject missing posting accounts.
+    - [x] Reject posting accounts whose currency differs from the posting currency.
+    - [x] Save the ledger transaction.
+    - [x] Save the journal entry.
+    - [x] Save all postings.
+    - [x] Flush before creating side effects that depend on generated ids.
+- [x] Update cached account balances inside the same transaction:
+    - [x] Debit customer asset accounts by reducing available and ledger balances.
+    - [x] Credit customer asset accounts by increasing available and ledger balances.
+    - [x] Document any internal account balance behavior that is deferred to later phases.
+    - [x] Keep balance update logic isolated so Phase 4 transfer validation can reuse it.
+- [x] Prevent destructive updates to posted ledger records:
+    - [x] Remove normal workflow paths that update posted `LedgerTransactionEntity` fields after posting.
+    - [x] Remove normal workflow paths that update `JournalEntryEntity` after posting.
+    - [x] Remove normal workflow paths that update `PostingEntity` after posting.
+    - [x] Add comments or method names that make append-only intent clear at repository/service boundaries.
+    - [x] Leave reversals and adjustments as future append-only workflows.
+- [x] Add audit event creation:
+    - [x] Create `LEDGER_TRANSACTION_POSTED` audit event.
+    - [x] Use `LEDGER_TRANSACTION` as the audited entity type.
+    - [x] Store the posted transaction id as the audited entity id.
+    - [x] Include actor type and correlation id from the command.
+    - [x] Keep audit save inside the posting transaction.
+- [x] Add outbox event creation:
+    - [x] Create `LedgerTransactionPosted` outbox event.
+    - [x] Use the ledger transaction id as the aggregate id.
+    - [x] Include transaction id, currency, amount, transaction type, and posted timestamp in the payload.
+    - [x] Save the outbox event with `PENDING` status inside the posting transaction.
+- [x] Add focused domain tests:
+    - [x] Valid debit and credit postings are accepted.
+    - [x] Single-sided posting list is rejected.
+    - [x] Debit-only posting list is rejected.
+    - [x] Credit-only posting list is rejected.
+    - [x] Unbalanced totals are rejected.
+    - [x] Mixed currencies are rejected.
+    - [x] Zero amount is rejected.
+    - [x] Negative amount is rejected.
+    - [x] Transaction amount mismatch is rejected.
+- [x] Add service integration tests:
+    - [x] Valid command persists one ledger transaction.
+    - [x] Valid command persists one journal entry.
+    - [x] Valid command persists all postings.
+    - [x] Valid command creates one audit event.
+    - [x] Valid command creates one pending outbox event.
+    - [x] Duplicate external reference is rejected.
+    - [x] Missing posting account is rejected.
+    - [x] Account currency mismatch is rejected.
+    - [x] Failure after transaction save rolls back journal entries and postings.
+    - [x] Failure after journal entry save rolls back ledger transaction and postings.
+    - [x] Failure after posting save rolls back audit and outbox records.
+- [x] Add persistence guard tests:
+    - [x] Posting amount database check rejects non-positive values.
+    - [x] Journal debit and credit total check rejects unbalanced totals.
+    - [x] Ledger transaction status and posted timestamp checks reject invalid combinations.
+    - [x] Composite currency foreign keys reject mismatched ledger, journal, posting, and account currencies.
+
+### Acceptance Criteria
+
+- [x] A valid journal entry can be posted.
+- [x] Unbalanced journal entries are rejected before persistence.
+- [x] Single-sided journal entries are rejected.
+- [x] Mixed-currency journal entries are rejected before persistence.
+- [x] Zero or negative posting amounts are rejected before persistence.
+- [x] Posting account currency mismatches are rejected before persistence.
+- [x] Posted ledger records cannot be destructively changed by normal workflows.
+- [x] Posting creates journal entries, postings, audit events, and outbox records atomically.
+- [x] Rollback tests prove partial postings are not committed.
+- [x] Domain tests cover all double-entry invariants.
+- [x] Service integration tests cover success, duplicate reference, missing account, currency mismatch, and rollback paths.
+- [x] Persistence tests prove schema constraints reject invalid ledger rows.
+
+## Phase 4: Internal Transfer API
+
+Goal: Implement safe account-to-account transfers using the ledger posting engine.
+
+### Steps
+
+- [x] Prepare transfer package structure:
+    - [x] Add `transfer.api` for REST controllers.
+    - [x] Add `transfer.api.dto` for request and response DTOs.
+    - [x] Add `transfer.application.command` for write commands.
+    - [x] Add `transfer.application.query` for lookup queries.
+    - [x] Add `transfer.application.service` for transfer use cases.
+    - [x] Add `transfer.domain.policy` for transfer validation rules.
+- [x] Add transfer API DTOs:
+    - [x] Create `CreateTransferRequest`.
+    - [x] Require `sourceAccountId`.
+    - [x] Require `destinationAccountId`.
+    - [x] Require `currencyCode` as exactly 3 uppercase letters.
+    - [x] Require positive `amountMinor`.
+    - [x] Allow optional `externalReference`.
+    - [x] Allow optional `description`.
+    - [x] Create `TransferResponse`.
+    - [x] Include transfer id, source account id, destination account id, status, currency, amount, ledger transaction id, external reference, description, timestamps, and failure fields.
+- [x] Add transfer command and query objects:
+    - [x] Create `CreateTransferCommand`.
+    - [x] Include source account id, destination account id, currency code, amount minor, external reference, description, idempotency key, actor type, and correlation id.
+    - [x] Create `GetTransferByIdQuery`.
+    - [x] Create `GetTransferByExternalReferenceQuery` if lookup by external reference is useful.
+- [x] Add transfer repository lookup methods:
+    - [x] Add `findByExternalReference`.
+    - [x] Add `existsByExternalReference`.
+    - [x] Add `findByLedgerTransactionId`.
+- [x] Add idempotency support for transfer creation:
+    - [x] Read the `Idempotency-Key` request header.
+    - [x] Reject missing idempotency keys for `POST /api/v1/transfers`.
+    - [x] Validate idempotency key length and blank values.
+    - [x] Compute a stable request hash from the normalized transfer command.
+    - [x] Store idempotency records with operation scope `TRANSFER_CREATE`.
+    - [x] Replay the original response for the same key and same request hash.
+    - [x] Reject the same key with a different request hash.
+- [x] Implement transfer validation policy:
+    - [x] Reject missing source account ids.
+    - [x] Reject missing destination account ids.
+    - [x] Reject same source and destination account ids.
+    - [x] Reject zero or negative amount minor values.
+    - [x] Normalize and validate currency codes through `CurrencyCode`.
+    - [x] Reject source account not found.
+    - [x] Reject destination account not found.
+    - [x] Reject source accounts that cannot be debited.
+    - [x] Reject destination accounts that cannot be credited.
+    - [x] Reject source account currency mismatch.
+    - [x] Reject destination account currency mismatch.
+    - [x] Reject insufficient available balance before posting.
+- [x] Implement `CreateTransferUseCase`:
+    - [x] Annotate the public handler with `@Transactional`.
+    - [x] Check idempotency before creating new records.
+    - [x] Validate duplicate external reference before insert when present.
+    - [x] Load source and destination accounts.
+    - [x] Run transfer validation before creating ledger postings.
+    - [x] Save a `TransferRequestEntity` with `PENDING` status.
+    - [x] Build a `PostLedgerTransactionCommand` with one debit and one credit posting.
+    - [x] Call `PostLedgerTransactionUseCase` to post the ledger transaction.
+    - [x] Update the transfer request to `COMPLETED` with the ledger transaction id and completed timestamp.
+    - [x] Store the idempotency response after successful completion.
+    - [x] Let unexpected failures roll back the transfer, ledger postings, audit, outbox, and idempotency writes.
+- [x] Add transfer lookup use case:
+    - [x] Load transfer by id.
+    - [x] Return `TransferResponse`.
+    - [x] Return structured not-found errors through the shared exception model.
+- [x] Add transfer REST controller:
+    - [x] `POST /api/v1/transfers`.
+    - [x] `GET /api/v1/transfers/{transferId}`.
+    - [x] Map request DTOs to commands.
+    - [x] Include correlation id and actor type in commands.
+    - [x] Return `201 Created` for new transfer creation.
+    - [x] Return `200 OK` for idempotency replay.
+- [x] Add transfer service tests:
+    - [x] Successful transfer persists a completed transfer request.
+    - [x] Successful transfer creates one ledger transaction.
+    - [x] Successful transfer creates one debit posting and one credit posting.
+    - [x] Successful transfer updates source and destination balances.
+    - [x] Duplicate idempotency key with the same request replays the original response.
+    - [x] Duplicate idempotency key with a different request is rejected.
+    - [x] Duplicate external reference is rejected.
+    - [x] Missing source account is rejected.
+    - [x] Missing destination account is rejected.
+    - [x] Same source and destination account is rejected.
+    - [x] Source account status rejection is returned as a structured business error.
+    - [x] Destination account status rejection is returned as a structured business error.
+    - [x] Currency mismatch is rejected before ledger posting.
+    - [x] Insufficient funds is rejected before ledger posting.
+    - [x] Ledger posting failure rolls back the transfer request.
+- [x] Add transfer API tests:
+    - [x] Valid create request returns `201`.
+    - [x] Idempotency replay returns `200` and the original response body.
+    - [x] Missing idempotency key returns structured validation error.
+    - [x] Invalid request body returns structured validation error.
+    - [x] Validation failures return structured business errors.
+    - [x] Transfer lookup returns the transfer response.
+    - [x] Missing transfer lookup returns structured not-found error.
+- [x] Add transfer persistence tests:
+    - [x] External reference uniqueness is enforced.
+    - [x] Ledger transaction uniqueness is enforced.
+    - [x] Source and destination account foreign keys are enforced.
+    - [x] Source and destination account currency foreign keys reject mismatches.
+    - [x] Amount check rejects non-positive amounts.
+    - [x] Completed status requires `completed_at`.
+
+### Acceptance Criteria
+
+- [x] `POST /api/v1/transfers` posts a valid transfer.
+- [x] The transfer creates exactly one debit posting and one credit posting.
+- [x] Source and destination cached balances are updated by the ledger posting engine.
+- [x] Duplicate requests with the same idempotency key return the original result.
+- [x] Duplicate requests with the same idempotency key and a different payload are rejected.
+- [x] Duplicate requests do not create duplicate ledger postings.
+- [x] Overdraft attempts are rejected consistently.
+- [x] Transfer validation failures return structured business errors.
+- [x] Transfer creation, ledger posting, audit, outbox, transfer status, and idempotency response commit atomically.
+- [x] Integration tests cover successful transfer, duplicate replay, idempotency conflict, and validation failures.
+- [x] API tests cover creation, replay, lookup, validation failures, and not-found responses.
+- [x] Persistence tests prove schema constraints reject invalid transfer rows.
+
+## Phase 5: Concurrency And Transaction Isolation
+
+Goal: Prove that concurrent transfers preserve correct balances and do not allow overdrafts.
+
+### Steps
+
+- [x] Audit current transactional boundaries:
+    - [x] Identify every write use case that updates account balances.
+    - [x] Confirm `CreateTransferUseCase` and `PostLedgerTransactionUseCase` run in one transaction for transfer creation.
+    - [x] Confirm idempotency record writes are committed atomically with transfer and ledger writes.
+    - [x] Document which repositories are called before balance mutation.
+- [x] Choose and document the account locking strategy:
+    - [x] Decide whether debit account validation uses pessimistic row locks, optimistic version retries, or a hybrid.
+    - [x] Document why the selected strategy prevents lost updates and overdrafts.
+    - [x] Document expected behavior when lock acquisition times out.
+    - [x] Document expected behavior when an optimistic version conflict occurs.
+- [x] Add locked account repository methods:
+    - [x] Add `findByIdForUpdate` for pessimistic account loading if selected.
+    - [x] Add deterministic multi-account lock ordering by account id to avoid deadlocks.
+    - [x] Add query-level lock timeout where supported.
+    - [x] Add repository tests proving the lock method starts and returns the expected account.
+- [x] Update transfer account loading:
+    - [x] Load source and destination accounts through the selected locking path.
+    - [x] Lock accounts in deterministic order.
+    - [x] Keep source and destination role mapping after ordered loading.
+    - [x] Validate balances only after locked account rows are loaded.
+- [x] Add concurrency error handling:
+    - [x] Map lock timeout failures to a structured `409 Conflict` or retryable business error.
+    - [x] Map optimistic locking failures to a structured `409 Conflict`.
+    - [x] Ensure retryable errors do not write transfer, ledger, idempotency, audit, or outbox records.
+    - [x] Add log messages that include correlation id but no sensitive payload.
+- [x] Add retry behavior if using optimistic locking:
+    - [x] Define max retry attempts.
+    - [x] Define backoff strategy.
+    - [x] Retry only safe transfer creation paths before any non-idempotent external publishing.
+    - [x] Stop retrying on validation failures such as insufficient funds or closed accounts.
+    - [x] Mark optimistic retries as not applicable because Phase 5 selected pessimistic account locks for transfer creation.
+- [x] Harden idempotency under concurrency:
+    - [x] Ensure concurrent requests with the same idempotency key cannot create duplicate records.
+    - [x] Handle unique constraint violations on `(operation_scope, idempotency_key)`.
+    - [x] Re-read the existing idempotency record after a duplicate-key race.
+    - [x] Re-read the existing idempotency record after account-lock waits before writing transfer or ledger rows.
+    - [x] Replay the stored response if the request hash matches.
+    - [x] Reject the request if the request hash differs.
+- [x] Add concurrent test fixtures:
+    - [x] Add a reusable executor helper with start latches and timeouts.
+    - [x] Add helpers to create funded accounts for concurrent scenarios.
+    - [x] Add helpers to collect all thread results and exceptions.
+    - [x] Add helpers to query final balances, transfers, ledger transactions, postings, and idempotency records.
+- [x] Add isolation and locking documentation:
+    - [x] Add ADR for transaction isolation and locking strategy.
+    - [x] Document database assumptions for Oracle.
+    - [x] Document why concurrent transfers preserve ledger invariants.
+    - [x] Document operational guidance for lock timeout and retryable failures.
+
+### Test Scenarios
+
+- [x] Sequential baseline transfer:
+    - [x] One valid transfer debits source and credits destination once.
+    - [x] Final source and destination balances match expected values.
+- [x] Concurrent independent transfers:
+    - [x] Transfers from different source accounts complete successfully.
+    - [x] No unrelated account balance is changed.
+- [x] Concurrent transfers from the same source account within available balance:
+    - [x] Multiple transfers complete.
+    - [x] Final source balance equals initial balance minus all completed transfer amounts.
+    - [x] Final destination balances equal initial balances plus their received amounts.
+    - [x] Ledger transaction count equals completed transfer count.
+    - [x] Posting count equals completed transfer count multiplied by two.
+- [x] Concurrent transfers from the same source account exceeding available balance:
+    - [x] Only transfers that fit within available balance complete.
+    - [x] Excess transfers are rejected with structured insufficient-funds or conflict errors.
+    - [x] Source available and ledger balances never become negative.
+    - [x] Rejected transfers do not create ledger transactions or postings.
+- [x] Concurrent transfers between the same two accounts:
+    - [x] No deadlock occurs.
+    - [x] Completed transfers preserve debit and credit totals.
+    - [x] Final balances are deterministic.
+- [x] Concurrent cross transfers between two accounts:
+    - [x] `A -> B` and `B -> A` requests do not deadlock.
+    - [x] Account locks are acquired in deterministic order.
+    - [x] Final balances reflect only completed transfers.
+- [x] Concurrent duplicate idempotency requests with the same payload:
+    - [x] Exactly one transfer request is created.
+    - [x] Exactly one ledger transaction is created.
+    - [x] Exactly two postings are created.
+    - [x] Every caller receives the same response body.
+    - [x] Replayed responses return `200 OK` after the original creation completes.
+- [x] Concurrent duplicate idempotency requests with different payloads:
+    - [x] One request may complete.
+    - [x] Conflicting requests are rejected with idempotency conflict errors.
+    - [x] No duplicate ledger postings are created.
+- [x] Concurrent duplicate external reference requests:
+    - [x] Exactly one transfer is created.
+    - [x] Other requests are rejected with duplicate request errors.
+    - [x] No duplicate ledger transaction external reference is created.
+- [x] Lock timeout behavior:
+    - [x] A transfer waiting on a locked source account fails with the documented structured error.
+    - [x] The timed-out request creates no transfer, ledger, posting, idempotency, audit, or outbox records.
+- [x] Optimistic conflict behavior, if optimistic locking is used:
+    - [x] Version conflict is retried up to the configured max attempts.
+    - [x] Successful retry creates one transfer and one ledger transaction.
+    - [x] Exhausted retry returns the documented structured error.
+    - [x] Mark optimistic retry assertions as not applicable because transfer creation uses pessimistic locking; API conflict mapping is covered.
+- [x] Rollback under concurrent failure:
+    - [x] A failure after transfer save but before ledger completion rolls back all writes.
+    - [x] Concurrent successful transfers are not rolled back by another request failure.
+- [x] Repeated-run stability:
+    - [x] Same-source concurrent transfer test passes repeatedly.
+    - [x] Same-key concurrent idempotency test passes repeatedly.
+
+### Acceptance Criteria
+
+- [x] Locking and isolation choices are documented in an ADR.
+- [x] Account rows are loaded through the selected locking strategy before balance validation.
+- [x] Account locks are acquired in deterministic order.
+- [x] Concurrent transfer tests pass repeatedly.
+- [x] Final cached account balances are correct after concurrent activity.
+- [x] Ledger transactions and postings match the number of completed transfers.
+- [x] Concurrent overdraft attempts never produce negative balances.
+- [x] Failed concurrent requests do not leave partial transfer, ledger, posting, audit, outbox, or idempotency writes.
+- [x] Duplicate concurrent idempotency requests create one transfer result.
+- [x] Lock timeout or optimistic conflict errors are structured and documented.
+
+## Phase 6: Reversal And Adjustment Flows
+
+Goal: Support operational correction without mutating posted financial records.
+
+### Steps
+
+- [x] Design reversal data model:
+    - [x] Define `reversals` table columns.
+    - [x] Include reversal id.
+    - [x] Include original transfer id.
+    - [x] Include original ledger transaction id.
+    - [x] Include reversal ledger transaction id.
+    - [x] Include reason code.
+    - [x] Include reason detail.
+    - [x] Include requested actor fields.
+    - [x] Include requested timestamp.
+    - [x] Include completed timestamp.
+    - [x] Include status.
+    - [x] Include failure reason fields.
+    - [x] Include version column.
+- [x] Add reversal schema constraints:
+    - [x] Enforce one reversal per original transfer.
+    - [x] Enforce one reversal per original ledger transaction.
+    - [x] Enforce unique reversal ledger transaction id.
+    - [x] Enforce foreign key to original transfer.
+    - [x] Enforce foreign key to original ledger transaction.
+    - [x] Enforce foreign key to reversal ledger transaction.
+    - [x] Enforce required reason code.
+    - [x] Enforce completed timestamp for completed reversals.
+    - [x] Enforce failure reason for failed or rejected reversals.
+- [x] Add reversal domain model:
+    - [x] Add `ReversalStatus`.
+    - [x] Add `ReversalReasonCode`.
+    - [x] Add reversal entity.
+    - [x] Add reversal repository.
+    - [x] Add repository lookup by original transfer id.
+    - [x] Add repository lookup by original ledger transaction id.
+- [x] Add reversal API DTOs:
+    - [x] Add `ReverseTransferRequest`.
+    - [x] Require reason code.
+    - [x] Allow optional reason detail.
+    - [x] Add `ReversalResponse`.
+    - [x] Include original transfer id.
+    - [x] Include original ledger transaction id.
+    - [x] Include reversal ledger transaction id.
+    - [x] Include status, reason fields, timestamps, and failure fields.
+- [x] Add reversal command and query objects:
+    - [x] Add `ReverseTransferCommand`.
+    - [x] Include transfer id.
+    - [x] Include reason code and reason detail.
+    - [x] Include actor type, actor role, and correlation id.
+    - [x] Add `GetReversalByTransferIdQuery`.
+- [x] Add reversal validation policy:
+    - [x] Reject missing reason code.
+    - [x] Reject blank reason code.
+    - [x] Reject unsupported reason code.
+    - [x] Reject missing transfer id.
+    - [x] Reject transfer not found.
+    - [x] Reject transfer that is not `COMPLETED`.
+    - [x] Reject transfer with missing ledger transaction id.
+    - [x] Reject duplicate reversal for the same transfer.
+    - [x] Reject unauthorized actor roles until Phase 7 security is implemented.
+- [x] Implement `ReverseTransferUseCase`:
+    - [x] Annotate handler with `@Transactional`.
+    - [x] Load the completed transfer.
+    - [x] Load original ledger transaction and postings.
+    - [x] Validate duplicate reversal before insert.
+    - [x] Save reversal request with `PENDING` status.
+    - [x] Build reversal postings by swapping debit and credit directions.
+    - [x] Build a `PostLedgerTransactionCommand` with transaction type `REVERSAL`.
+    - [x] Use a reversal external reference that links to the original transfer.
+    - [x] Call `PostLedgerTransactionUseCase`.
+    - [x] Update the original transfer status to `REVERSED`.
+    - [x] Update reversal status to `COMPLETED`.
+    - [x] Store the reversal ledger transaction id.
+    - [x] Return `ReversalResponse`.
+    - [x] Let unexpected failures roll back reversal, ledger, posting, audit, outbox, and transfer status changes.
+- [x] Add reversal REST controller:
+    - [x] Add `POST /api/v1/transfers/{transferId}/reverse`.
+    - [x] Map request DTO to command.
+    - [x] Include correlation id and actor headers.
+    - [x] Return `201 Created` for successful reversal.
+    - [x] Return structured errors for validation failures.
+- [x] Add adjustment data model:
+    - [x] Define whether adjustments use a dedicated `adjustment_requests` table.
+    - [x] Include adjustment id.
+    - [x] Include ledger transaction id.
+    - [x] Include reason code.
+    - [x] Include reason detail.
+    - [x] Include actor fields.
+    - [x] Include status and timestamps.
+- [x] Add adjustment API DTOs:
+    - [x] Add `CreateAdjustmentRequest`.
+    - [x] Require currency code.
+    - [x] Require amount minor.
+    - [x] Require reason code.
+    - [x] Require at least two posting lines.
+    - [x] Add `AdjustmentPostingLineRequest`.
+    - [x] Add `AdjustmentResponse`.
+- [x] Add adjustment validation policy:
+    - [x] Reject missing reason code.
+    - [x] Reject blank reason code.
+    - [x] Reject unsupported reason code.
+    - [x] Reject fewer than two posting lines.
+    - [x] Reject unbalanced debit and credit totals.
+    - [x] Reject posting account not found.
+    - [x] Reject posting account currency mismatch.
+    - [x] Reject accounts that cannot be debited or credited.
+    - [x] Reject insufficient funds for debit lines.
+- [x] Implement `CreateAdjustmentUseCase`:
+    - [x] Annotate handler with `@Transactional`.
+    - [x] Validate request.
+    - [x] Save adjustment request with `PENDING` status if using a table.
+    - [x] Build a `PostLedgerTransactionCommand` with transaction type `ADJUSTMENT`.
+    - [x] Call `PostLedgerTransactionUseCase`.
+    - [x] Mark adjustment as `COMPLETED`.
+    - [x] Return `AdjustmentResponse`.
+    - [x] Let unexpected failures roll back adjustment, ledger, posting, audit, and outbox writes.
+- [x] Add adjustment REST controller:
+    - [x] Add `POST /api/v1/ops/adjustments`.
+    - [x] Map request DTO to command.
+    - [x] Include correlation id and actor headers.
+    - [x] Return `201 Created` for successful adjustment.
+- [x] Add audit events:
+    - [x] Write `TRANSFER_REVERSED` audit event after successful reversal.
+    - [x] Write `ADJUSTMENT_POSTED` audit event after successful adjustment.
+    - [x] Include reason code and correlation id.
+    - [x] Do not mutate original ledger audit events.
+- [x] Add outbox events:
+    - [x] Write `LedgerTransactionReversed` after successful reversal.
+    - [x] Write `AdjustmentPosted` after successful adjustment.
+    - [x] Ensure outbox rows commit atomically with ledger writes.
+- [x] Add authorization placeholders:
+    - [x] Require `X-Actor-Role` or equivalent header until Phase 7 JWT roles exist.
+    - [x] Allow reversal only for `OPS_ADMIN` or `SERVICE`.
+    - [x] Allow adjustment only for `OPS_ADMIN` or `SERVICE`.
+    - [x] Return structured `403` for unauthorized roles.
+- [x] Add immutable ledger documentation:
+    - [x] Add ADR for immutable ledger reversal model.
+    - [x] Document why reversals create new ledger transactions instead of updating original postings.
+    - [x] Document adjustment use cases and guardrails.
+
+### Test Scenarios
+
+- [x] Reversal API success:
+    - [x] `POST /api/v1/transfers/{transferId}/reverse` returns `201 Created`.
+    - [x] Response includes original transfer id.
+    - [x] Response includes original ledger transaction id.
+    - [x] Response includes reversal ledger transaction id.
+    - [x] Response includes completed status.
+- [x] Reversal ledger behavior:
+    - [x] Reversal creates one new ledger transaction with type `REVERSAL`.
+    - [x] Reversal creates equal and opposite postings.
+    - [x] Original ledger transaction remains unchanged.
+    - [x] Original journal entry remains unchanged.
+    - [x] Original postings remain unchanged.
+    - [x] Source and destination balances return to pre-transfer values.
+- [x] Reversal transfer status behavior:
+    - [x] Original transfer status changes from `COMPLETED` to `REVERSED`.
+    - [x] Original transfer keeps original ledger transaction id.
+    - [x] Reversal record stores reversal ledger transaction id.
+- [x] Duplicate reversal:
+    - [x] Second reversal request for same transfer is rejected.
+    - [x] Duplicate reversal does not create a second reversal ledger transaction.
+    - [x] Duplicate reversal does not create additional postings.
+- [x] Reversal reason validation:
+    - [x] Missing reason code returns structured validation error.
+    - [x] Blank reason code returns structured validation error.
+    - [x] Unsupported reason code returns structured validation error.
+    - [x] Reason detail exceeding max length returns structured validation error.
+- [x] Reversal transfer validation:
+    - [x] Missing transfer id path variable is handled by routing.
+    - [x] Unknown transfer id returns structured not-found error.
+    - [x] Transfer without ledger transaction id is rejected.
+    - [x] Transfer in `PENDING` status is rejected.
+    - [x] Transfer in `FAILED` status is rejected.
+    - [x] Transfer in `REJECTED` status is rejected.
+    - [x] Transfer already in `REVERSED` status is rejected.
+- [x] Reversal authorization:
+    - [x] Missing actor role is rejected.
+    - [x] `CUSTOMER` role is rejected.
+    - [x] `TELLER` role is rejected.
+    - [x] `AUDITOR` role is rejected.
+    - [x] `OPS_ADMIN` role is accepted.
+    - [x] `SERVICE` role is accepted.
+- [x] Reversal rollback:
+    - [x] Failure after reversal request save rolls back reversal record.
+    - [x] Failure after reversal ledger save rolls back ledger, journal, postings, audit, outbox, and transfer status.
+    - [x] Original transfer remains `COMPLETED` after rollback.
+- [x] Reversal audit and outbox:
+    - [x] Successful reversal writes `TRANSFER_REVERSED` audit event.
+    - [x] Audit event includes transfer id, reversal ledger transaction id, reason code, and correlation id.
+    - [x] Successful reversal writes `LedgerTransactionReversed` outbox event.
+    - [x] Rollback prevents audit and outbox rows from persisting.
+- [x] Reversal persistence constraints:
+    - [x] Unique reversal per original transfer is enforced.
+    - [x] Unique reversal per original ledger transaction is enforced.
+    - [x] Unique reversal ledger transaction id is enforced.
+    - [x] Foreign key to original transfer is enforced.
+    - [x] Foreign key to original ledger transaction is enforced.
+    - [x] Foreign key to reversal ledger transaction is enforced.
+    - [x] Completed reversal requires completed timestamp.
+    - [x] Failed reversal requires failure reason.
+- [x] Adjustment API success:
+    - [x] `POST /api/v1/ops/adjustments` returns `201 Created`.
+    - [x] Response includes adjustment id if an adjustment table exists.
+    - [x] Response includes ledger transaction id.
+    - [x] Response includes completed status.
+- [x] Adjustment ledger behavior:
+    - [x] Adjustment creates one new ledger transaction with type `ADJUSTMENT`.
+    - [x] Adjustment creates all requested postings.
+    - [x] Debit total equals credit total.
+    - [x] Affected account balances are updated by posting direction.
+- [x] Adjustment request validation:
+    - [x] Missing currency code returns structured validation error.
+    - [x] Invalid currency code returns structured validation error.
+    - [x] Missing amount returns structured validation error.
+    - [x] Non-positive amount returns structured validation error.
+    - [x] Missing reason code returns structured validation error.
+    - [x] Blank reason code returns structured validation error.
+    - [x] Fewer than two posting lines returns structured validation error.
+    - [x] Unbalanced posting lines return structured business error.
+    - [x] Posting account not found returns structured not-found error.
+    - [x] Posting account currency mismatch returns structured business error.
+    - [x] Debit from frozen account is rejected.
+    - [x] Credit to closed account is rejected.
+    - [x] Insufficient funds on debit account is rejected.
+- [x] Adjustment authorization:
+    - [x] Missing actor role is rejected.
+    - [x] `CUSTOMER` role is rejected.
+    - [x] `TELLER` role is rejected unless explicitly allowed.
+    - [x] `AUDITOR` role is rejected.
+    - [x] `OPS_ADMIN` role is accepted.
+    - [x] `SERVICE` role is accepted.
+- [x] Adjustment rollback:
+    - [x] Ledger posting failure rolls back adjustment record.
+    - [x] Ledger posting failure rolls back ledger, journal, postings, audit, and outbox.
+    - [x] Account balances remain unchanged after rollback.
+- [x] Adjustment audit and outbox:
+    - [x] Successful adjustment writes `ADJUSTMENT_POSTED` audit event.
+    - [x] Audit event includes ledger transaction id, reason code, and correlation id.
+    - [x] Successful adjustment writes `AdjustmentPosted` outbox event.
+- [x] Adjustment persistence constraints, if an adjustment table exists:
+    - [x] Ledger transaction uniqueness is enforced.
+    - [x] Reason code is required.
+    - [x] Completed adjustment requires completed timestamp.
+    - [x] Failed adjustment requires failure reason.
+
+### Acceptance Criteria
+
+- [x] `POST /api/v1/transfers/{transferId}/reverse` reverses a completed transfer.
+- [x] Reversal creates a new reversal ledger transaction.
+- [x] Reversal creates equal and opposite postings.
+- [x] Original ledger records remain unchanged.
+- [x] Original transfer is marked `REVERSED`.
+- [x] Duplicate reversal attempts are rejected.
+- [x] Reversal requires a valid reason code.
+- [x] Unauthorized users cannot reverse transactions.
+- [x] `POST /api/v1/ops/adjustments` posts a balanced adjustment.
+- [x] Adjustment creates a new adjustment ledger transaction.
+- [x] Adjustment updates affected account balances through the ledger posting engine.
+- [x] Unauthorized users cannot post adjustments.
+- [x] Reversal and adjustment audit events are written.
+- [x] Reversal and adjustment outbox events are written atomically.
+- [x] Rollback tests prove no partial reversal or adjustment writes persist.
+- [x] Persistence tests prove reversal and adjustment constraints reject invalid rows.
+- [x] ADR documents immutable ledger reversal and adjustment design.
+
+## Phase 7: Authentication, Authorization, And API Security
+
+Goal: Add a clear authentication model and protect customer, teller, auditor, operations, and service workflows with role-based access.
+
+### Steps
+
+- [x] Choose authentication strategy for the portfolio version:
+    - [x] Use JWT bearer tokens for API authentication.
+    - [x] Use local signed JWTs for development and tests.
+    - [x] Keep the design compatible with a future external identity provider.
+    - [x] Document accepted JWT issuer, audience, subject, role, customer id, and actor id claims.
+    - [x] Decide token lifetime for local development tokens.
+    - [x] Decide whether service-to-service clients use a dedicated `SERVICE` role claim.
+- [x] Add security dependencies and configuration properties:
+    - [x] Add Spring Security resource server dependencies if missing.
+    - [x] Add local JWT signing key or JWK configuration for `dev`.
+    - [x] Add issuer and audience properties.
+    - [x] Add token clock skew property.
+    - [x] Add configuration properties tests for required security settings.
+- [x] Add JWT resource server configuration:
+    - [x] Configure stateless session policy.
+    - [x] Disable CSRF for stateless REST APIs.
+    - [x] Configure bearer token authentication.
+    - [x] Validate issuer.
+    - [x] Validate audience.
+    - [x] Validate expiry.
+    - [x] Validate not-before if present.
+    - [x] Reject unsigned or wrongly signed tokens.
+    - [x] Keep `/actuator/health`, OpenAPI docs, and Swagger UI public.
+    - [x] Require authentication for all business API endpoints by default.
+- [x] Add role and principal model:
+    - [x] Add `SecurityRole` enum with `CUSTOMER`, `TELLER`, `AUDITOR`, `OPS_ADMIN`, and `SERVICE`.
+    - [x] Add authenticated principal model with subject, actor id, actor type, roles, optional customer id, and token id.
+    - [x] Add mapper from JWT claims to authenticated principal.
+    - [x] Add mapper from principal roles to Spring Security authorities.
+    - [x] Add mapper from principal to existing audit actor fields.
+    - [x] Reject tokens with missing subject.
+    - [x] Reject tokens with no recognized roles.
+    - [x] Reject customer tokens that do not include `customerId`.
+    - [x] Reject malformed `customerId` claim.
+- [x] Add development authentication support:
+    - [x] Add local token factory for tests.
+    - [x] Add sample development users for customer, teller, auditor, ops admin, and service.
+    - [x] Add optional dev-only endpoint or command for issuing sample tokens.
+    - [x] Ensure dev token issuance is disabled outside development profile.
+    - [x] Add README or docs snippet showing how to get sample tokens locally.
+- [x] Add structured authentication and authorization errors:
+    - [x] Return `401` for missing bearer token.
+    - [x] Return `401` for invalid signature.
+    - [x] Return `401` for expired token.
+    - [x] Return `401` for malformed token.
+    - [x] Return `401` for invalid issuer or audience.
+    - [x] Return `403` for authenticated users without required role.
+    - [x] Return `403` for ownership violations.
+    - [x] Use the existing `ApiErrorResponse` shape.
+    - [x] Include correlation id in security error responses.
+    - [x] Do not leak token values or cryptographic details in error messages.
+- [x] Replace temporary actor headers for protected workflows:
+    - [x] Derive actor type from the authenticated principal.
+    - [x] Derive actor role from the authenticated principal.
+    - [x] Derive actor id from the authenticated principal.
+    - [x] Stop trusting `X-Actor-Type` for protected endpoints.
+    - [x] Stop trusting `X-Actor-Role` for protected endpoints.
+    - [x] Keep `X-Correlation-Id` as a request tracing header.
+    - [x] Ensure audit events use principal-derived actor fields.
+- [x] Define endpoint authorization matrix:
+    - [x] Public endpoints: health, OpenAPI docs, Swagger UI.
+    - [x] Customer account read endpoints require `CUSTOMER` and ownership.
+    - [x] Customer transfer creation requires `CUSTOMER` and source account ownership.
+    - [x] Teller customer/account management endpoints require `TELLER` or `OPS_ADMIN`.
+    - [x] Auditor read-only ledger and audit endpoints require `AUDITOR` or `OPS_ADMIN`.
+    - [x] Transfer reversal endpoint requires `OPS_ADMIN` or `SERVICE`.
+    - [x] Adjustment endpoint requires `OPS_ADMIN` or `SERVICE`.
+    - [x] Reconciliation operation endpoints require `OPS_ADMIN` or `SERVICE`.
+    - [x] Internal publishing or integration endpoints require `SERVICE`.
+    - [x] Deny access by default for unclassified endpoints.
+- [x] Add method-level authorization:
+    - [x] Enable method security.
+    - [x] Add authorization annotations to use cases or controllers.
+    - [x] Prefer method-level checks for ownership-sensitive business operations.
+    - [x] Keep HTTP route rules coarse and method rules domain-specific.
+    - [x] Add authorization tests at controller and use-case boundaries.
+- [x] Add customer ownership checks:
+    - [x] Add service to check account ownership by customer id.
+    - [x] Add ownership check for account detail lookup.
+    - [x] Add ownership check for account transaction list.
+    - [x] Add ownership check for customer-initiated transfer source account.
+    - [x] Reject access to another customer's account with structured `403`.
+    - [x] Avoid returning `404` for authorization failures unless explicitly documented.
+- [x] Protect account and customer endpoints:
+    - [x] Require authentication for account creation.
+    - [x] Allow `TELLER` or `OPS_ADMIN` to create customer accounts.
+    - [x] Allow `CUSTOMER` to read owned accounts.
+    - [x] Prevent `CUSTOMER` from creating accounts for other customers.
+    - [x] Prevent `AUDITOR` from mutating accounts.
+    - [x] Prevent `SERVICE` from customer-facing account operations unless explicitly allowed.
+- [x] Protect transfer endpoints:
+    - [x] Require authentication for transfer creation.
+    - [x] Allow customer transfer only from owned source account.
+    - [x] Allow teller or ops workflows only if intentionally supported.
+    - [x] Keep idempotency key validation independent from authentication.
+    - [x] Ensure unauthorized transfer requests do not create idempotency records.
+    - [x] Ensure unauthorized transfer requests do not mutate balances.
+- [x] Protect reversal and adjustment endpoints:
+    - [x] Require `OPS_ADMIN` or `SERVICE` for reversal.
+    - [x] Require `OPS_ADMIN` or `SERVICE` for adjustment.
+    - [x] Reject `CUSTOMER`, `TELLER`, and `AUDITOR`.
+    - [x] Use principal actor fields in reversal and adjustment command objects.
+    - [x] Ensure unauthorized requests do not create reversal or adjustment request rows.
+    - [x] Ensure unauthorized requests do not create ledger, audit, or outbox rows.
+- [x] Protect audit and investigation endpoints:
+    - [x] Require `AUDITOR` or `OPS_ADMIN` for audit event queries.
+    - [x] Require `AUDITOR`, `OPS_ADMIN`, or `SERVICE` for ledger transaction investigation lookup.
+    - [x] Ensure read-only roles cannot call mutating endpoints.
+    - [x] Add paging limits to prevent broad unrestricted reads.
+- [x] Add CORS configuration:
+    - [x] Allow configured local frontend origins in development.
+    - [x] Do not allow wildcard origins with credentials.
+    - [x] Allow `Authorization`, `Content-Type`, `Idempotency-Key`, and `X-Correlation-Id` headers.
+    - [x] Add preflight tests for protected endpoints.
+- [x] Add security logging and privacy guardrails:
+    - [x] Log authentication failures without token content.
+    - [x] Log authorization failures with subject, roles, endpoint, and correlation id.
+    - [x] Do not log bearer tokens.
+    - [x] Do not log raw JWT claims containing sensitive values.
+    - [x] Add test or static check for accidental token logging where practical.
+- [x] Add security test utilities:
+    - [x] Add test JWT builder.
+    - [x] Add helpers for each role.
+    - [x] Add helper for customer token with customer id.
+    - [x] Add helper for expired token.
+    - [x] Add helper for invalid issuer or audience.
+    - [x] Add helper for token signed with wrong key.
+- [x] Add security documentation:
+    - [x] Add ADR for authentication and authorization design.
+    - [x] Document JWT claims and role mapping.
+    - [x] Document endpoint authorization matrix.
+    - [x] Document local token generation.
+    - [x] Document the planned migration from local JWTs to an external identity provider.
+
+### Test Scenarios
+
+- [x] JWT validation:
+    - [x] Missing `Authorization` header returns `401`.
+    - [x] Non-bearer `Authorization` header returns `401`.
+    - [x] Malformed bearer token returns `401`.
+    - [x] Token signed with the wrong key returns `401`.
+    - [x] Expired token returns `401`.
+    - [x] Token used before `nbf` returns `401`.
+    - [x] Token with invalid issuer returns `401`.
+    - [x] Token with invalid audience returns `401`.
+    - [x] Token with missing subject returns `401`.
+    - [x] Token with no recognized roles returns `403` or `401` according to documented policy.
+- [x] Principal mapping:
+    - [x] `CUSTOMER` role maps to customer authority.
+    - [x] `TELLER` role maps to teller authority.
+    - [x] `AUDITOR` role maps to auditor authority.
+    - [x] `OPS_ADMIN` role maps to ops admin authority.
+    - [x] `SERVICE` role maps to service authority.
+    - [x] Multiple roles map to multiple authorities.
+    - [x] Customer token requires valid customer id.
+    - [x] Non-customer token may omit customer id.
+    - [x] Principal exposes actor id for audit.
+- [x] Public endpoint access:
+    - [x] Health endpoint is accessible without token.
+    - [x] OpenAPI docs are accessible without token.
+    - [x] Swagger UI is accessible without token.
+    - [x] Business endpoint without token is rejected.
+- [x] Account endpoint authorization:
+    - [x] Customer can read an owned account.
+    - [x] Customer cannot read another customer's account.
+    - [x] Customer can list transactions only for an owned account.
+    - [x] Customer cannot list transactions for another customer's account.
+    - [x] Teller can create an account for a customer.
+    - [x] Auditor cannot create an account.
+    - [x] Service role cannot call customer account mutation endpoints unless explicitly allowed.
+- [x] Transfer authorization:
+    - [x] Customer can create a transfer from an owned source account.
+    - [x] Customer cannot create a transfer from another customer's account.
+    - [x] Unauthorized transfer attempt does not create idempotency record.
+    - [x] Unauthorized transfer attempt does not create transfer request.
+    - [x] Unauthorized transfer attempt does not create ledger rows.
+    - [x] Unauthorized transfer attempt does not change balances.
+- [x] Reversal authorization:
+    - [x] `OPS_ADMIN` can reverse a completed transfer.
+    - [x] `SERVICE` can reverse a completed transfer.
+    - [x] `CUSTOMER` cannot reverse a transfer.
+    - [x] `TELLER` cannot reverse a transfer.
+    - [x] `AUDITOR` cannot reverse a transfer.
+    - [x] Unauthorized reversal attempt does not create reversal, ledger, audit, or outbox rows.
+- [x] Adjustment authorization:
+    - [x] `OPS_ADMIN` can post an adjustment.
+    - [x] `SERVICE` can post an adjustment.
+    - [x] `CUSTOMER` cannot post an adjustment.
+    - [x] `TELLER` cannot post an adjustment.
+    - [x] `AUDITOR` cannot post an adjustment.
+    - [x] Unauthorized adjustment attempt does not create adjustment, ledger, audit, or outbox rows.
+- [x] Audit and investigation authorization:
+    - [x] `AUDITOR` can query audit events.
+    - [x] `OPS_ADMIN` can query audit events.
+    - [x] `CUSTOMER` cannot query audit events.
+    - [x] `TELLER` cannot query audit events unless explicitly allowed.
+    - [x] `AUDITOR` can query ledger transaction investigation details.
+    - [x] Read-only roles cannot mutate reversal, adjustment, or reconciliation resources.
+- [x] Structured security errors:
+    - [x] Authentication failures use `ApiErrorResponse`.
+    - [x] Authorization failures use `ApiErrorResponse`.
+    - [x] Security error responses include correlation id.
+    - [x] Security error responses do not include token text.
+    - [x] Security error responses do not expose signing key, algorithm details, or stack traces.
+- [x] CORS:
+    - [x] Allowed dev origin receives expected CORS headers.
+    - [x] Disallowed origin is rejected or omitted from CORS headers.
+    - [x] Preflight allows `Authorization`, `Idempotency-Key`, and `X-Correlation-Id`.
+    - [x] Wildcard origin is not used with credentials.
+
+### Acceptance Criteria
+
+- [x] Unauthenticated requests are rejected.
+- [x] Invalid or expired JWTs are rejected.
+- [x] Valid JWTs are converted into the correct authenticated principal.
+- [x] Customer users can only access permitted customer APIs.
+- [x] Customer users cannot access another customer's account data.
+- [x] Tellers can perform teller workflows but cannot perform auditor-only or ops-admin-only actions.
+- [x] Auditors can query ledger and audit data.
+- [x] Ops admins can perform reversal and reconciliation workflows.
+- [x] Service role access is limited to internal service endpoints.
+- [x] Unauthorized role access returns `403`.
+- [x] Missing or invalid credentials return `401`.
+- [x] Security tests cover authentication and authorization rules.
+- [x] Actor fields are derived from JWT claims, not trusted request headers.
+- [x] Customer ownership checks prevent cross-customer account access.
+- [x] Unauthorized requests do not produce financial writes.
+- [x] Security ADR and endpoint authorization matrix are documented.
+
+## Phase 8: Audit Trail And Investigation APIs
+
+Goal: Provide traceability for financial operations and operational troubleshooting.
+
+### Steps
+
+- [x] Review current audit event schema and usage:
+    - [x] Inventory all current audit event writes.
+    - [x] Confirm account creation writes audit event.
+    - [x] Confirm ledger transaction posting writes audit event.
+    - [x] Confirm transfer reversal writes audit event.
+    - [x] Confirm adjustment posting writes audit event.
+    - [x] Identify missing actor role, channel, and payload fields in existing writes.
+    - [x] Document audit payload fields that are safe to store.
+- [x] Add audit event writer service:
+    - [x] Add a single `AuditEventWriter` component.
+    - [x] Accept event type, entity type, entity id, actor, correlation id, channel, and payload.
+    - [x] Serialize payload through `ObjectMapper`.
+    - [x] Reject payloads that cannot be serialized.
+    - [x] Keep writer transactional with the caller.
+    - [x] Replace direct repository writes in account, ledger, reversal, and adjustment flows.
+    - [x] Preserve existing audit event names.
+- [x] Normalize audit event types and entity types:
+    - [x] Use enums for all application-written audit event types.
+    - [x] Use enums for all application-written audit entity types.
+    - [x] Add `TRANSFER_CREATED` if transfer creation needs a business-level event separate from ledger posting.
+    - [x] Add `TRANSFER_REVERSED`.
+    - [x] Add `ADJUSTMENT_POSTED`.
+    - [x] Add `RECONCILIATION_BATCH_IMPORTED` for future reconciliation.
+    - [x] Add `RECONCILIATION_COMPLETED` for future reconciliation.
+    - [x] Add tests that fail on unsupported audit event strings.
+- [x] Capture actor and request context consistently:
+    - [x] Add request context accessor for current principal.
+    - [x] Add request context accessor for current correlation id.
+    - [x] Add request channel value such as `API`, `SYSTEM`, or `BATCH`.
+    - [x] Ensure audit writer uses principal-derived actor fields from Phase 7.
+    - [x] Use `SYSTEM` actor for internal scheduled/system work.
+    - [x] Ensure missing actor context is explicit and not silently null for protected endpoints.
+- [x] Define audit payload policy:
+    - [x] Allow identifiers, reason codes, status, amount, currency, and high-level metadata.
+    - [x] Do not store bearer tokens.
+    - [x] Do not store passwords, verification codes, secrets, or signing material.
+    - [x] Do not store full request bodies by default.
+    - [x] Do not store PII unless required for investigation.
+    - [x] Add helper to build small structured payload maps.
+    - [x] Add documentation for allowed and disallowed audit payload data.
+- [x] Add audit event query model:
+    - [x] Add `AuditEventResponse`.
+    - [x] Include audit event id.
+    - [x] Include event type.
+    - [x] Include entity type and entity id.
+    - [x] Include actor type, actor role, and actor id.
+    - [x] Include channel.
+    - [x] Include correlation id.
+    - [x] Include created timestamp.
+    - [x] Include parsed or raw payload according to API design.
+- [x] Add audit event query filters:
+    - [x] Filter by event type.
+    - [x] Filter by entity type.
+    - [x] Filter by entity id.
+    - [x] Filter by actor type.
+    - [x] Filter by actor role.
+    - [x] Filter by actor id.
+    - [x] Filter by correlation id.
+    - [x] Filter by created-from timestamp.
+    - [x] Filter by created-to timestamp.
+    - [x] Add deterministic sort by created timestamp and id.
+    - [x] Add pagination with default size and max size.
+    - [x] Validate invalid page, size, and date ranges.
+- [x] Add audit event query repository support:
+    - [x] Add specifications or explicit repository query method for filters.
+    - [x] Ensure filters compose correctly.
+    - [ ] Add indexes if query performance requires them.
+    - [ ] Avoid loading large payloads unnecessarily if a summary endpoint is added.
+    - [x] Add repository tests for each important filter.
+- [x] Add audit event query use case:
+    - [x] Validate filter command.
+    - [x] Enforce maximum page size.
+    - [x] Enforce valid time range.
+    - [x] Return stable paged response.
+    - [x] Preserve payload JSON without reformatting unless intentionally parsed.
+- [x] Add audit event REST endpoint:
+    - [x] Add `GET /api/v1/audit/events`.
+    - [x] Map query parameters to audit query command.
+    - [x] Return paged audit events.
+    - [x] Require `AUDITOR` or `OPS_ADMIN`.
+    - [x] Return structured errors for invalid filters.
+    - [ ] Add OpenAPI examples later in Phase 12.
+- [x] Add audit event detail endpoint:
+    - [x] Add `GET /api/v1/audit/events/{auditEventId}`.
+    - [x] Return a single audit event by id.
+    - [x] Return structured `404` for missing audit event.
+    - [x] Require `AUDITOR` or `OPS_ADMIN`.
+    - [x] Include payload for detail response.
+- [x] Enforce audit immutability through application workflows:
+    - [x] Do not expose update endpoint for audit events.
+    - [x] Do not expose delete endpoint for audit events.
+    - [x] Keep repository package-private where practical or document service-only usage.
+    - [x] Add tests proving unsupported update/delete routes return `404` or `405`.
+    - [ ] Consider database trigger or permissions later if required.
+- [x] Add ledger transaction investigation query model:
+    - [x] Add `LedgerTransactionInvestigationResponse`.
+    - [x] Include ledger transaction fields.
+    - [x] Include journal entry id and status.
+    - [x] Include posting ids, account ids, directions, amount, currency, and created timestamp.
+    - [x] Include related transfer if one exists.
+    - [x] Include related reversal if one exists.
+    - [x] Include related adjustment if one exists.
+    - [x] Include related audit event ids.
+    - [x] Include related outbox event ids and statuses.
+- [x] Add ledger transaction investigation use case:
+    - [x] Load ledger transaction by id.
+    - [x] Load journal entry and postings.
+    - [x] Load related transfer by ledger transaction id.
+    - [x] Load related reversal by original or reversal ledger transaction id.
+    - [x] Load related adjustment by ledger transaction id.
+    - [x] Load audit events by entity id and related ids.
+    - [x] Load outbox events by aggregate id and related ids.
+    - [x] Return structured `404` for unknown transaction id.
+    - [x] Avoid N+1 queries where practical.
+- [x] Add ledger transaction investigation REST endpoint:
+    - [x] Add `GET /api/v1/ops/ledger/transactions/{transactionId}`.
+    - [x] Require `AUDITOR`, `OPS_ADMIN`, or `SERVICE`.
+    - [x] Return investigation response.
+    - [x] Return structured `404` for missing ledger transaction.
+    - [x] Return structured `400` for invalid UUID path values.
+- [ ] Add account investigation endpoint if useful:
+    - [ ] Add `GET /api/v1/ops/accounts/{accountId}/timeline`.
+    - [ ] Include account state.
+    - [ ] Include ledger postings affecting the account.
+    - [ ] Include related audit events.
+    - [ ] Require `AUDITOR` or `OPS_ADMIN`.
+    - [ ] Keep this endpoint optional if ledger transaction investigation is sufficient.
+- [x] Add correlation id support:
+    - [x] Confirm correlation id filter sets request context.
+    - [x] Ensure every API response includes correlation id.
+    - [x] Ensure audit queries can filter by correlation id.
+    - [x] Ensure investigation responses include related correlation ids.
+    - [x] Ensure logs include correlation id for audit/investigation endpoint calls.
+- [x] Add structured investigation error codes:
+    - [x] Add or reuse `RESOURCE_NOT_FOUND` for missing audit event.
+    - [x] Add or reuse `RESOURCE_NOT_FOUND` for missing ledger transaction.
+    - [x] Add validation error for invalid filters.
+    - [x] Add validation error for date range where `createdFrom > createdTo`.
+    - [x] Add validation error for page size above max.
+- [x] Add privacy and redaction checks:
+    - [x] Review all audit payloads for secrets and token values.
+    - [x] Add tests that audit payloads do not include authorization headers.
+    - [x] Add tests that audit payloads do not include idempotency keys unless explicitly approved.
+    - [x] Add tests that validation or authentication failures do not write sensitive audit payloads.
+- [x] Add audit and investigation documentation:
+    - [x] Add ADR for audit trail and investigation API design.
+    - [x] Document audit event schema and payload policy.
+    - [x] Document query filters and pagination.
+    - [x] Document investigation endpoint response shape.
+    - [x] Document role access for audit and investigation APIs.
+
+### Test Scenarios
+
+- [x] Audit writer:
+    - [x] Writer persists event type, entity type, entity id, actor fields, channel, correlation id, payload, and timestamp.
+    - [x] Writer serializes structured payload correctly.
+    - [x] Writer rejects unserializable payload with a clear exception.
+    - [x] Writer participates in caller transaction.
+    - [x] Rollback of caller transaction rolls back audit event.
+    - [x] Writer does not persist bearer token or secret fields.
+- [ ] Audit event creation coverage:
+    - [x] Account creation writes expected audit event.
+    - [x] Ledger transaction posting writes expected audit event.
+    - [ ] Transfer creation writes expected audit event if business-level transfer auditing is added.
+    - [x] Transfer reversal writes `TRANSFER_REVERSED`.
+    - [x] Adjustment posting writes `ADJUSTMENT_POSTED`.
+    - [x] Audit event contains principal-derived actor fields.
+    - [x] Audit event contains correlation id.
+    - [x] Audit event payload includes safe identifiers and reason codes.
+- [x] Audit query filters:
+    - [x] Query by event type returns matching events only.
+    - [x] Query by entity type returns matching events only.
+    - [x] Query by entity id returns matching events only.
+    - [x] Query by actor type returns matching events only.
+    - [x] Query by actor role returns matching events only.
+    - [x] Query by actor id returns matching events only.
+    - [x] Query by correlation id returns matching events only.
+    - [x] Query by created-from excludes older events.
+    - [x] Query by created-to excludes newer events.
+    - [x] Combined filters are applied with `AND` semantics.
+    - [x] Empty result returns an empty page.
+- [x] Audit query pagination and sorting:
+    - [x] Default page size is applied when size is omitted.
+    - [x] Maximum page size is enforced.
+    - [x] Invalid negative page returns structured validation error.
+    - [x] Invalid zero or negative size returns structured validation error.
+    - [x] `createdFrom > createdTo` returns structured validation error.
+    - [x] Results sort deterministically by created timestamp and id.
+    - [x] Page metadata includes page number, size, total elements, and total pages.
+- [x] Audit event REST endpoint:
+    - [x] `GET /api/v1/audit/events` returns `200` for `AUDITOR`.
+    - [x] `GET /api/v1/audit/events` returns `200` for `OPS_ADMIN`.
+    - [x] `CUSTOMER` receives `403`.
+    - [x] `TELLER` receives `403` unless explicitly allowed.
+    - [x] Missing token receives `401`.
+    - [x] Invalid filter returns structured `400`.
+    - [x] Response does not include sensitive payload fields.
+- [x] Audit event detail endpoint:
+    - [x] Existing audit event id returns `200`.
+    - [x] Missing audit event id returns structured `404`.
+    - [x] Invalid UUID returns structured `400`.
+    - [x] `AUDITOR` and `OPS_ADMIN` can access detail.
+    - [x] Unauthorized roles receive `403`.
+- [x] Audit immutability:
+    - [x] `POST /api/v1/audit/events` is not available.
+    - [x] `PUT /api/v1/audit/events/{id}` is not available.
+    - [x] `PATCH /api/v1/audit/events/{id}` is not available.
+    - [x] `DELETE /api/v1/audit/events/{id}` is not available.
+    - [x] Normal application workflows never update existing audit event rows.
+- [x] Ledger transaction investigation:
+    - [x] Existing ledger transaction returns transaction details.
+    - [x] Response includes journal entry details.
+    - [x] Response includes all postings.
+    - [x] Response includes related transfer for transfer ledger transaction.
+    - [x] Response includes related reversal for reversal ledger transaction.
+    - [x] Response includes related adjustment for adjustment ledger transaction.
+    - [x] Response includes related audit event ids.
+    - [x] Response includes related outbox event ids and statuses.
+    - [x] Unknown ledger transaction id returns structured `404`.
+    - [x] Invalid UUID returns structured `400`.
+- [x] Ledger investigation authorization:
+    - [x] `AUDITOR` can query ledger investigation endpoint.
+    - [x] `OPS_ADMIN` can query ledger investigation endpoint.
+    - [x] `SERVICE` can query ledger investigation endpoint if allowed by matrix.
+    - [x] `CUSTOMER` receives `403`.
+    - [x] `TELLER` receives `403` unless explicitly allowed.
+    - [x] Missing token receives `401`.
+- [x] Correlation id behavior:
+    - [x] Query response includes request correlation id.
+    - [x] Audit filters can find events by correlation id.
+    - [x] Investigation response includes operation correlation ids.
+    - [x] Missing `X-Correlation-Id` uses generated correlation id if current filter behavior supports it.
+- [x] Privacy and redaction:
+    - [x] Audit payloads do not include bearer token.
+    - [x] Audit payloads do not include password-like fields.
+    - [x] Audit payloads do not include verification codes.
+    - [x] Audit payloads do not include signing keys or secrets.
+    - [x] Error responses from audit endpoints do not include stack traces.
+    - [x] Logs for audit queries include correlation id but not sensitive query payloads.
+
+### Acceptance Criteria
+
+- [x] Every financial operation creates an audit event.
+- [x] Audit events are immutable through application workflows.
+- [x] `GET /api/v1/ops/ledger/transactions/{transactionId}` returns investigation details.
+- [x] `GET /api/v1/audit/events` supports filtering.
+- [x] Correlation IDs appear in API responses and logs.
+- [x] Sensitive data is not written to logs or audit payloads.
+- [x] Audit and investigation APIs are protected by Phase 7 roles.
+- [x] Audit query endpoints support pagination and deterministic sorting.
+- [x] Investigation response links ledger, postings, transfer, reversal, adjustment, audit, and outbox records where applicable.
+- [x] ADR documents audit payload policy, query model, and investigation API design.
+
+## Phase 9: Outbox And Kafka Publishing
+
+Goal: Publish financial events reliably without losing consistency between database commits and Kafka messages.
+
+### Steps
+
+- [x] Finalize outbox schema:
+    - [x] Confirm `outbox_events` has aggregate type, aggregate id, event type, destination, correlation id, payload, status, retry count, retry timestamp, error message, created timestamp, published timestamp, and version.
+    - [x] Add status values for `PENDING`, `PUBLISHED`, `FAILED`, and `DEAD_LETTERED` if missing.
+    - [x] Add indexes for status and next retry timestamp.
+    - [x] Add index for aggregate type and aggregate id.
+    - [x] Add index for event type.
+    - [x] Add check constraints for status and retry count.
+    - [x] Add optimistic version column if missing.
+- [x] Define outbox domain model:
+    - [x] Add `OutboxEventType` values for all published events.
+    - [x] Add `OutboxDestination` values for Kafka topics.
+    - [x] Add `OutboxPublishStatus` transition rules.
+    - [x] Add payload envelope model with event id, event type, aggregate id, occurred timestamp, schema version, and data.
+    - [x] Add event schema version constants.
+- [x] Add outbox writer service:
+    - [x] Centralize outbox row creation in one component.
+    - [x] Accept aggregate metadata, event type, destination, correlation id, and payload.
+    - [x] Serialize payload with `ObjectMapper`.
+    - [x] Reject unserializable payloads.
+    - [x] Write inside the caller transaction.
+    - [x] Replace direct outbox repository writes in ledger, reversal, adjustment, and later reconciliation flows.
+- [x] Ensure atomic financial writes:
+    - [x] Confirm ledger posting writes outbox event in the same transaction.
+    - [x] Confirm reversal writes outbox event in the same transaction.
+    - [x] Confirm adjustment writes outbox event in the same transaction.
+    - [x] Confirm rollback removes outbox rows when financial writes fail.
+    - [x] Document which use cases write which event types.
+- [x] Implement outbox publisher worker:
+    - [x] Add scheduled publisher component.
+    - [x] Select eligible events with `PENDING` or retryable `FAILED` status.
+    - [x] Lock selected rows to prevent duplicate publisher instances from publishing the same event.
+    - [x] Publish in deterministic batch order.
+    - [x] Make batch size configurable.
+    - [x] Make scheduler interval configurable.
+    - [x] Skip publishing when worker is disabled by config.
+- [x] Add Kafka publishing:
+    - [x] Configure Kafka producer properties.
+    - [x] Publish event payload to destination topic.
+    - [x] Use outbox event id as Kafka message key or header.
+    - [x] Include correlation id in Kafka headers.
+    - [x] Include event type and schema version in Kafka headers.
+    - [x] Mark event `PUBLISHED` only after successful send acknowledgement.
+    - [x] Store published timestamp.
+- [x] Publish required events:
+    - [x] `LedgerTransactionPosted`
+    - [x] `LedgerTransactionReversed`
+    - [x] `AdjustmentPosted`
+    - [x] `AccountBalanceChanged`
+    - [x] `ReconciliationMismatchFound`
+    - [x] `ReconciliationCompleted`
+- [x] Add retry handling:
+    - [x] Increment retry count on publish failure.
+    - [x] Store last error message with safe truncation.
+    - [x] Compute next retry timestamp with bounded exponential backoff.
+    - [x] Stop retrying after max attempts.
+    - [x] Move exhausted events to `DEAD_LETTERED`.
+    - [x] Make max attempts configurable.
+- [x] Add dead-letter handling:
+    - [x] Define when an event is dead-lettered.
+    - [x] Keep dead-lettered rows queryable.
+    - [x] Add optional admin endpoint or repository query for dead-lettered events.
+    - [x] Ensure dead-lettering does not delete payloads.
+    - [x] Document manual recovery steps.
+- [x] Add replay strategy:
+    - [x] Add admin use case to requeue dead-lettered or failed events.
+    - [x] Require `OPS_ADMIN` or `SERVICE` for replay.
+    - [x] Preserve original event id and payload.
+    - [x] Reset retry count only when explicitly requested.
+    - [x] Audit replay requests.
+    - [x] Prevent replay of already published events unless explicitly forced.
+- [x] Add observability:
+    - [x] Add metric for pending outbox count.
+    - [x] Add metric for oldest pending event age.
+    - [x] Add metric for publish success count.
+    - [x] Add metric for publish failure count.
+    - [x] Add metric for dead-letter count.
+    - [x] Log publish failures with correlation id and event id.
+    - [x] Do not log full event payload by default.
+- [x] Add documentation:
+    - [x] Add ADR for outbox and Kafka publishing strategy.
+    - [x] Document topic names and event schemas.
+    - [x] Document retry and dead-letter policy.
+    - [x] Document replay procedure.
+    - [x] Document local Kafka setup.
+
+### Test Scenarios
+
+- [x] Outbox schema and persistence:
+    - [x] Valid outbox row persists with `PENDING` status.
+    - [x] Invalid status is rejected by schema.
+    - [x] Negative retry count is rejected.
+    - [x] Event payload is required.
+    - [x] Aggregate id is required.
+    - [x] Status and retry indexes support publisher query.
+- [x] Outbox writer:
+    - [x] Writer persists expected aggregate metadata.
+    - [x] Writer serializes payload.
+    - [x] Writer rejects unserializable payload.
+    - [x] Writer uses caller correlation id.
+    - [x] Writer participates in caller transaction.
+    - [x] Rollback removes outbox rows.
+- [x] Financial event creation:
+    - [x] Ledger posting creates `LedgerTransactionPosted`.
+    - [x] Reversal creates `LedgerTransactionReversed`.
+    - [x] Adjustment creates `AdjustmentPosted`.
+    - [x] Balance-changing flow creates expected `AccountBalanceChanged` events if implemented.
+    - [x] Reconciliation mismatch creates `ReconciliationMismatchFound`.
+- [x] Publisher success:
+    - [x] Pending event is sent to Kafka.
+    - [x] Published event is marked `PUBLISHED`.
+    - [x] Published timestamp is set.
+    - [x] Kafka headers include event id, event type, schema version, and correlation id.
+    - [x] Already published event is not republished by normal scheduler.
+- [x] Publisher concurrency:
+    - [x] Two publisher workers do not publish the same event.
+    - [x] Row lock prevents duplicate processing.
+    - [x] Failed lock acquisition is retried later.
+    - [x] Batch ordering is deterministic.
+- [x] Retry and dead-letter:
+    - [x] Publish failure increments retry count.
+    - [x] Publish failure stores safe error message.
+    - [x] Next retry timestamp uses backoff.
+    - [x] Event is not retried before next retry timestamp.
+    - [x] Event moves to `DEAD_LETTERED` after max attempts.
+    - [x] Dead-lettered event is not published by normal scheduler.
+- [x] Replay:
+    - [x] Failed event can be requeued.
+    - [x] Dead-lettered event can be requeued by authorized actor.
+    - [x] Published event cannot be replayed without force.
+    - [x] Unauthorized replay returns `403`.
+    - [x] Replay request writes audit event.
+- [x] Metrics and logging:
+    - [x] Pending count metric is correct.
+    - [x] Oldest pending age metric is correct.
+    - [x] Success and failure counters increment.
+    - [x] Logs include event id and correlation id.
+    - [x] Logs do not include full payload by default.
+
+### Acceptance Criteria
+
+- [x] Financial transaction and outbox record commit atomically.
+- [x] Kafka publishing marks outbox records as published.
+- [x] Failed publish attempts are retried.
+- [x] Poison messages are handled according to the dead-letter strategy.
+- [x] Tests prove event records are not lost during rollback.
+- [x] Outbox behavior is documented.
+- [x] Concurrent publishers do not duplicate messages.
+- [x] Replay is controlled, audited, and documented.
+- [x] Metrics expose publish health and lag.
+
+## Phase 10: Reconciliation
+
+Goal: Simulate settlement batch import, compare external settlement data with internal ledger state, and report mismatches.
+
+### Steps
+
+- [x] Add reconciliation schema:
+    - [x] `settlement_batches`
+    - [x] `settlement_items`
+    - [x] `reconciliation_results`
+    - [x] Add batch id, source, file/reference name, imported by actor, status, imported timestamp, completed timestamp, counts, and version.
+    - [x] Add item id, batch id, external transaction reference, amount, currency, status, settlement date, raw line hash, and metadata.
+    - [x] Add result id, batch id, item id, ledger transaction id, mismatch type, severity, status, detail, and timestamps.
+    - [x] Add uniqueness for batch source plus external transaction reference.
+    - [x] Add indexes for batch id, external reference, mismatch type, and status.
+- [x] Define reconciliation domain model:
+    - [x] Add `SettlementBatchStatus`.
+    - [x] Add `SettlementItemStatus`.
+    - [x] Add `ReconciliationResultStatus`.
+    - [x] Add `ReconciliationMismatchType`.
+    - [x] Add severity enum for informational, warning, and critical mismatches.
+- [x] Add settlement batch import DTOs:
+    - [x] Add `CreateSettlementBatchRequest`.
+    - [x] Add `SettlementItemRequest`.
+    - [x] Require source.
+    - [x] Require external transaction reference.
+    - [x] Require amount and currency.
+    - [x] Require settlement status.
+    - [x] Require settlement date.
+    - [x] Validate max batch size.
+    - [x] Add response DTOs for batch, item, and result summaries.
+- [x] Add settlement batch validation policy:
+    - [x] Reject missing source.
+    - [x] Reject empty item list.
+    - [x] Reject batch larger than configured maximum.
+    - [x] Reject duplicate external references in the same batch.
+    - [x] Reject invalid currency codes.
+    - [x] Reject non-positive amounts where settlement status requires an amount.
+    - [x] Reject unsupported settlement statuses.
+    - [x] Return structured validation errors.
+- [x] Implement settlement batch creation use case:
+    - [x] Save batch with `PENDING` or `IMPORTED` status.
+    - [x] Save all settlement items.
+    - [x] Store item raw line hash or canonical hash.
+    - [x] Store imported actor and correlation id.
+    - [x] Run reconciliation synchronously for portfolio simplicity or document async decision.
+    - [x] Mark batch `COMPLETED` after reconciliation.
+    - [x] Roll back the batch transaction if synchronous reconciliation fails unexpectedly.
+    - [x] Ensure failed transaction rolls back partial batch if synchronous.
+- [x] Match settlement items to internal ledger transactions:
+    - [x] Match by external reference.
+    - [x] Optionally match by idempotency resource id if available.
+    - [x] Ignore reversed transactions only if documented.
+    - [x] Include reversal and adjustment transaction types in matching rules.
+    - [x] Define how duplicate internal matches are handled.
+    - [x] Define how duplicate external matches are handled.
+- [x] Detect mismatches:
+    - [x] Missing internal transaction.
+    - [x] Missing external settlement item.
+    - [x] Amount mismatch.
+    - [x] Currency mismatch.
+    - [x] Status mismatch.
+    - [x] Duplicate external item.
+    - [x] Duplicate internal transaction reference.
+    - [x] Reversed transaction settled as successful.
+    - [x] Settlement item outside expected date window.
+- [x] Add reconciliation result query use cases:
+    - [x] Query batch by id.
+    - [x] Query batch list with filters.
+    - [x] Query result list by batch id.
+    - [x] Filter results by mismatch type.
+    - [x] Filter results by severity.
+    - [x] Filter results by status.
+    - [x] Add pagination and deterministic sorting.
+- [x] Add reconciliation REST endpoints:
+    - [x] `POST /api/v1/ops/reconciliation/batches`.
+    - [x] `GET /api/v1/ops/reconciliation/batches`.
+    - [x] `GET /api/v1/ops/reconciliation/batches/{batchId}`.
+    - [x] `GET /api/v1/ops/reconciliation/batches/{batchId}/results`.
+    - [x] Require `OPS_ADMIN` or `SERVICE` for import.
+    - [x] Require `AUDITOR` or `OPS_ADMIN` for queries.
+- [x] Add audit events:
+    - [x] Write `RECONCILIATION_BATCH_IMPORTED`.
+    - [x] Write `RECONCILIATION_COMPLETED`.
+    - [x] Write `RECONCILIATION_FAILED` if import or comparison fails.
+    - [x] Include batch id, counts, mismatch count, source, actor, and correlation id.
+- [x] Add outbox events:
+    - [x] Publish `ReconciliationMismatchFound` for critical mismatches.
+    - [x] Publish `ReconciliationCompleted` for completed batch.
+    - [x] Ensure outbox rows commit atomically with reconciliation rows.
+- [x] Add documentation:
+    - [x] Add ADR for reconciliation design and matching rules.
+    - [x] Document supported mismatch types.
+    - [x] Document sample settlement batch payload.
+    - [x] Document operational review flow for mismatches.
+
+### Test Scenarios
+
+- [x] Batch schema and persistence:
+    - [x] Batch persists with source, actor, counts, status, and timestamps.
+    - [x] Settlement items persist under batch.
+    - [x] Reconciliation results persist under batch.
+    - [x] Duplicate external reference in same source is rejected or handled according to policy.
+    - [x] Batch version increments on status change.
+- [x] Import validation:
+    - [x] Missing source returns structured validation error.
+    - [x] Empty item list returns structured validation error.
+    - [x] Batch above max size returns structured validation error.
+    - [x] Invalid currency returns structured validation error.
+    - [x] Duplicate external reference in request returns structured validation error.
+    - [x] Unsupported settlement status returns structured validation error.
+- [x] Matching behavior:
+    - [x] Exact external reference, amount, currency, and status produces matched result.
+    - [x] Missing internal ledger transaction produces missing-internal mismatch.
+    - [x] Internal ledger transaction without external item produces missing-external mismatch.
+    - [x] Amount mismatch is detected.
+    - [x] Currency mismatch is detected.
+    - [x] Status mismatch is detected.
+    - [x] Duplicate external item is detected.
+    - [x] Duplicate internal reference is detected.
+    - [x] Reversed transaction settled as successful is detected.
+- [x] API behavior:
+    - [x] `POST /api/v1/ops/reconciliation/batches` returns created batch.
+    - [x] Batch response includes item count and mismatch count.
+    - [x] `GET /api/v1/ops/reconciliation/batches/{batchId}` returns batch summary.
+    - [x] Unknown batch id returns structured `404`.
+    - [x] Result list supports mismatch type filter.
+    - [x] Result list supports severity filter.
+    - [x] Result list supports pagination and sorting.
+- [x] Authorization:
+    - [x] `OPS_ADMIN` can import batch.
+    - [x] `SERVICE` can import batch.
+    - [x] `AUDITOR` can query batches and results.
+    - [x] `CUSTOMER` cannot import or query reconciliation.
+    - [x] `TELLER` cannot import unless explicitly allowed.
+- [x] Audit and outbox:
+    - [x] Import writes `RECONCILIATION_BATCH_IMPORTED`.
+    - [x] Completed batch writes `RECONCILIATION_COMPLETED`.
+    - [x] Critical mismatch writes `ReconciliationMismatchFound` outbox event.
+    - [x] Failed reconciliation rolls back or marks failed according to documented transaction policy.
+    - [x] Audit payload includes source, counts, mismatch count, and correlation id.
+
+### Acceptance Criteria
+
+- [x] `POST /api/v1/ops/reconciliation/batches` imports a settlement batch.
+- [x] `GET /api/v1/ops/reconciliation/batches/{batchId}` returns reconciliation results.
+- [x] Mismatches are detected and categorized.
+- [x] Mismatch events are added to the outbox.
+- [x] Reconciliation actions are audited.
+- [x] Tests cover matched, missing, and mismatched settlement items.
+- [x] Matching rules are documented and deterministic.
+- [x] Reconciliation APIs are protected by role.
+- [x] Batch and result queries support pagination and filtering.
+
+## Phase 11: Reporting And Oracle-Oriented SQL
+
+Goal: Demonstrate Oracle-friendly reporting and operational SQL skills.
+
+### Steps
+
+- [x] Define reporting folder structure:
+    - [x] Add `reports/sql/` for standalone SQL.
+    - [x] Add `reports/plsql/` for PL/SQL-style scripts.
+    - [x] Add `reports/README.md`.
+    - [x] Document required schema and sample data assumptions.
+- [x] Add report query conventions:
+    - [x] Use Oracle-compatible SQL.
+    - [x] Use bind variables for date ranges and account ids.
+    - [x] Avoid vendor-neutral syntax that Oracle does not support.
+    - [x] Include comments describing each report purpose.
+    - [x] Include expected columns in each report file.
+- [x] Add daily trial balance report:
+    - [x] Group by currency and account category.
+    - [x] Sum debit and credit postings.
+    - [x] Calculate net movement.
+    - [x] Include opening and closing balances if practical.
+    - [x] Filter by report date.
+- [x] Add account statement summary report:
+    - [x] Filter by account id.
+    - [x] Filter by date range.
+    - [x] Include ledger transaction id, posting direction, amount, currency, description, and timestamp.
+    - [x] Include running balance if practical with analytic functions.
+- [x] Add reconciliation mismatch report:
+    - [x] Filter by batch id.
+    - [x] Filter by mismatch type.
+    - [x] Include external reference, ledger transaction id, expected amount, actual amount, status, and detail.
+    - [x] Sort by severity and created timestamp.
+- [x] Add suspense account aging report:
+    - [x] Identify suspense or internal accounts by category or configured account numbers.
+    - [x] Group open suspense entries by age bucket.
+    - [x] Include 0-1 day, 2-7 days, 8-30 days, and 31+ days buckets.
+    - [x] Include amount totals by currency.
+- [x] Add top failed transfer reasons report:
+    - [x] Group failed transfers by failure reason code.
+    - [x] Count failures.
+    - [x] Sum failed amount by currency.
+    - [x] Filter by date range.
+    - [x] Sort by count descending.
+- [x] Add Oracle-specific examples:
+    - [x] Use analytic functions such as `sum(...) over (...)` where useful.
+    - [x] Use `case` expressions for buckets.
+    - [x] Use date truncation carefully with `timestamp with time zone`.
+    - [x] Include at least one CTE-heavy report.
+- [x] Add PL/SQL-style script:
+    - [x] Add function or procedure for one reporting workflow.
+    - [x] Include input parameters.
+    - [x] Include output cursor or table insert.
+    - [x] Include comments explaining how to run it locally.
+    - [x] Keep script optional and safe for local development.
+- [x] Add reporting integration support:
+    - [x] Add repository or JDBC test harness for reports where practical.
+    - [x] Seed deterministic data for report tests.
+    - [x] Assert report totals for known transactions.
+    - [x] Assert report rows for reversal and adjustment data.
+- [x] Add report documentation:
+    - [x] Document each report purpose.
+    - [x] Document parameters.
+    - [x] Document expected columns.
+    - [x] Document sample command for running through SQL client.
+    - [x] Document how reports support interview/demo storytelling.
+
+### Test Scenarios
+
+- [x] Daily trial balance:
+    - [x] Report returns one row per currency/account category.
+    - [x] Debit totals match seeded postings.
+    - [x] Credit totals match seeded postings.
+    - [x] Reversal postings are included as opposite movement.
+    - [x] Adjustment postings are included.
+    - [x] Date filter excludes outside transactions.
+- [x] Account statement summary:
+    - [x] Report returns postings for the selected account only.
+    - [x] Date range filter works.
+    - [x] Running balance is correct if included.
+    - [x] Transfer, reversal, and adjustment entries are distinguishable.
+    - [x] Unknown account returns no rows.
+- [x] Reconciliation mismatch report:
+    - [x] Report returns mismatches for selected batch.
+    - [x] Mismatch type filter works.
+    - [x] Severity sorting works.
+    - [x] Matched rows are excluded when report is mismatch-only.
+- [x] Suspense aging:
+    - [x] Entries fall into correct age bucket.
+    - [x] Totals are grouped by currency.
+    - [x] Empty suspense account returns zero or no rows according to report design.
+- [x] Failed transfer reasons:
+    - [x] Failures are grouped by reason code.
+    - [x] Counts are correct.
+    - [x] Amount totals are correct by currency.
+    - [x] Date range excludes old failures.
+- [x] SQL quality:
+    - [x] SQL scripts run against Oracle test schema.
+    - [x] Bind variables are used for dynamic values.
+    - [x] Report files are documented.
+    - [x] PL/SQL-style script compiles or is syntax-checked where practical.
+
+### Acceptance Criteria
+
+- [x] Reports return correct values for seeded test data.
+- [x] Report SQL is stored under a documented folder.
+- [x] At least one Oracle PL/SQL-style script is included.
+- [x] Reporting queries are covered by integration tests where practical.
+- [x] README or docs explain report purpose and execution.
+- [x] Reports demonstrate transfer, reversal, adjustment, and reconciliation data.
+- [x] Oracle-specific SQL features are used intentionally and documented.
+
+## Phase 12: API Documentation And Developer Experience
+
+Goal: Make the project easy to inspect, run, and review as a portfolio project.
+
+### Steps
+
+- [x] Add OpenAPI support:
+    - [x] Confirm Springdoc dependency and configuration.
+    - [x] Group public, customer, ops, audit, and admin endpoints if useful.
+    - [x] Add API title, description, version, and contact metadata.
+    - [x] Add JWT bearer security scheme.
+    - [x] Add idempotency header documentation.
+    - [x] Add correlation id header documentation.
+- [x] Document endpoint contracts:
+    - [x] Account creation and lookup.
+    - [x] Account transaction listing.
+    - [x] Transfer creation and lookup.
+    - [x] Transfer reversal.
+    - [x] Adjustment posting.
+    - [x] Reconciliation batch import and query.
+    - [x] Audit event query and detail.
+    - [x] Ledger transaction investigation.
+    - [x] Outbox replay or admin endpoints if added.
+- [x] Add request and response examples:
+    - [x] Successful account creation.
+    - [x] Successful transfer.
+    - [x] Idempotency replay.
+    - [x] Idempotency conflict.
+    - [x] Successful reversal.
+    - [x] Successful adjustment.
+    - [x] Reconciliation mismatch batch.
+    - [x] Audit query response.
+    - [x] Security error response.
+    - [x] Validation error response.
+- [x] Add common error documentation:
+    - [x] Document `ApiErrorResponse`.
+    - [x] Document validation error shape.
+    - [x] Document authentication error shape.
+    - [x] Document authorization error shape.
+    - [x] Document concurrency conflict response.
+    - [x] Document idempotency conflict response.
+    - [x] Document not-found response.
+- [x] Add seed data for local development:
+    - [x] Add deterministic customers.
+    - [x] Add deterministic accounts with balances.
+    - [x] Add sample completed transfer.
+    - [x] Add sample reversed transfer.
+    - [x] Add sample adjustment.
+    - [x] Add sample reconciliation batch.
+    - [x] Add sample users or token fixtures for each role.
+    - [x] Ensure seed data is idempotent.
+- [x] Add developer commands:
+    - [x] Add Makefile or documented shell commands.
+    - [x] Command to run unit tests.
+    - [x] Command to run integration tests.
+    - [x] Command to start local dependencies.
+    - [x] Command to run the API.
+    - [x] Command to apply migrations.
+    - [x] Command to generate sample tokens.
+    - [x] Command to run report SQL examples.
+- [x] Add local environment documentation:
+    - [x] Document required Java version.
+    - [x] Document Oracle setup.
+    - [x] Document Kafka setup.
+    - [x] Document environment variables.
+    - [x] Document profiles.
+    - [x] Document troubleshooting steps for common startup failures.
+- [x] Add diagrams:
+    - [x] Add architecture diagram.
+    - [x] Add request flow diagram for transfer creation.
+    - [x] Add reversal flow diagram.
+    - [x] Add outbox publishing diagram.
+    - [x] Add ERD diagram.
+    - [x] Keep diagrams in source-controlled editable format.
+- [x] Complete ADR set:
+    - [x] Double-entry model.
+    - [x] Amount and currency representation.
+    - [x] Transaction isolation.
+    - [x] Locking strategy.
+    - [x] Immutable ledger and reversal model.
+    - [x] Idempotency design.
+    - [x] Authentication and authorization design.
+    - [x] Audit trail and investigation API design.
+    - [x] Outbox/event publishing strategy.
+    - [x] Reconciliation matching strategy.
+- [x] Add demo collection:
+    - [x] Add HTTP files or Postman collection.
+    - [x] Include happy-path flow.
+    - [x] Include duplicate idempotency replay.
+    - [x] Include reversal flow.
+    - [x] Include adjustment flow.
+    - [x] Include reconciliation flow.
+    - [x] Include audit investigation flow.
+    - [x] Include role-specific tokens or token generation steps.
+- [x] Add quality-of-life docs:
+    - [x] Add glossary for banking terms used in the project.
+    - [x] Add feature matrix by phase.
+    - [x] Add known limitations.
+    - [x] Add future improvements.
+
+### Test Scenarios
+
+- [x] OpenAPI:
+    - [x] API docs endpoint is available locally.
+    - [x] OpenAPI JSON includes bearer security scheme.
+    - [x] Transfer endpoint documents `Idempotency-Key`.
+    - [x] Endpoints document `X-Correlation-Id`.
+    - [x] Error schema is included.
+    - [x] Example payloads are valid JSON.
+- [x] Seed data:
+    - [x] Seed script can run on empty database.
+    - [x] Seed script can run twice without duplicates.
+    - [x] Seeded transfer can be queried.
+    - [x] Seeded reversal can be queried.
+    - [x] Seeded adjustment can be queried.
+    - [x] Seeded users/tokens work in documented flows.
+- [x] Developer commands:
+    - [x] Test command succeeds.
+    - [x] API run command starts application.
+    - [x] Local dependency command starts required services where practical.
+    - [x] Token command produces usable development tokens.
+    - [x] Report command returns sample output where practical.
+- [x] Demo collection:
+    - [x] Collection creates account successfully.
+    - [x] Collection posts transfer successfully.
+    - [x] Collection proves idempotency replay.
+    - [x] Collection reverses transfer.
+    - [x] Collection posts adjustment.
+    - [x] Collection imports reconciliation batch.
+    - [x] Collection queries audit trail.
+- [x] Documentation quality:
+    - [x] README setup instructions are complete.
+    - [x] Diagram files exist.
+    - [x] ADR links work.
+    - [x] Known limitations are documented.
+    - [x] No secrets are present in docs or examples.
+
+### Acceptance Criteria
+
+- [x] A reviewer can run the project from README instructions.
+- [x] API documentation is available locally.
+- [x] Example requests demonstrate the core flows.
+- [x] Architecture and ERD diagrams exist in `docs/`.
+- [x] ADRs explain the most important technical decisions.
+- [x] Seed data and demo collection support an end-to-end demo.
+- [x] Developer commands reduce setup friction.
+- [x] Documentation avoids secrets and environment-specific private values.
+
+## Phase 13: CI/CD And Quality Gates
+
+Goal: Add automated verification so the project looks production-oriented.
+
+### Steps
+
+- [x] Add GitHub Actions workflow structure:
+    - [x] Trigger on pull requests.
+    - [x] Trigger on pushes to main branch.
+    - [x] Add concurrency cancellation for repeated branch pushes.
+    - [x] Cache Maven dependencies.
+    - [x] Use the project Java version.
+    - [x] Split fast checks and integration checks if useful.
+- [x] Run Maven verification:
+    - [x] Compile main code.
+    - [x] Compile test code.
+    - [x] Run unit tests.
+    - [x] Run integration tests.
+    - [x] Publish test reports as artifacts on failure.
+    - [x] Ensure CI uses the same profile assumptions documented in README.
+- [x] Add CI database strategy:
+    - [x] Use Oracle Free service containers instead of Testcontainers.
+    - [x] Document Oracle Free CI strategy.
+    - [x] Run Flyway migrations in CI.
+    - [x] Verify migration validation.
+    - [x] Ensure integration tests do not depend on developer-local database.
+- [x] Build artifacts:
+    - [x] Package Spring Boot jar.
+    - [x] Upload jar artifact where useful.
+    - [x] Build Docker image.
+    - [x] Verify Docker image starts or passes a smoke test.
+    - [x] Add image labels with version and commit SHA.
+- [x] Add static quality checks:
+    - [x] Document formatter gate as intentionally deferred until a style profile is chosen.
+    - [x] Document checkstyle as intentionally deferred until rules are low-friction.
+    - [x] Add dependency analysis if useful.
+    - [x] Add forbidden secrets scan.
+    - [x] Add YAML and Markdown linting if practical.
+- [x] Add dependency and container security scanning:
+    - [x] Run Maven dependency vulnerability scan.
+    - [x] Run container image vulnerability scan.
+    - [x] Decide fail thresholds.
+    - [x] Document how to handle false positives.
+    - [x] Upload scan results as artifacts.
+- [x] Add coverage reporting:
+    - [x] Add JaCoCo report generation.
+    - [x] Upload coverage artifact.
+    - [x] Add coverage summary to CI logs.
+    - [x] Document why no coverage threshold is enforced yet.
+    - [x] Document generated/configuration class exclusions as future threshold work.
+- [x] Add migration safety checks:
+    - [x] Run Flyway validate.
+    - [x] Run migrations from a clean database.
+    - [x] Ensure no migration checksum drift.
+    - [x] Add test that all JPA entities match schema assumptions where practical.
+- [x] Add branch protection guidance:
+    - [x] Document required checks.
+    - [x] Document how to rerun failed jobs.
+    - [x] Document local commands matching CI.
+    - [x] Add CI status badge if repository is public.
+
+### Test Scenarios
+
+- [x] CI workflow behavior:
+    - [x] Pull request triggers CI.
+    - [x] Push to main triggers CI.
+    - [x] Failed unit test fails CI.
+    - [x] Failed integration test fails CI.
+    - [x] Compilation failure fails CI.
+    - [x] Migration failure fails CI.
+- [x] CI database setup:
+    - [x] Clean database receives migrations.
+    - [x] Integration tests can create and clean data.
+    - [x] CI database does not depend on local developer state.
+    - [x] Failed container startup produces clear logs.
+- [x] Artifact build:
+    - [x] Jar builds successfully.
+    - [x] Docker image builds successfully.
+    - [x] Docker image smoke test succeeds.
+    - [x] Build artifact is uploaded on successful run if configured.
+- [x] Quality gates:
+    - [x] Formatting gate is documented as intentionally deferred.
+    - [x] Vulnerability above threshold fails scan job if enabled.
+    - [x] Secret scan runs on repository contents.
+    - [x] Coverage report is generated.
+    - [x] Coverage threshold is documented as intentionally not enforced yet.
+- [x] Developer parity:
+    - [x] README local command matches CI command.
+    - [x] CI profile is documented.
+    - [x] CI status badge points to correct workflow.
+
+### Acceptance Criteria
+
+- [x] CI runs on pull requests and pushes.
+- [x] CI fails if tests fail.
+- [x] CI builds the API package.
+- [x] CI verifies Docker image build.
+- [x] Test coverage summary is available.
+- [x] README shows CI status badge if repository is public.
+- [x] Integration tests run without relying on a developer-local database.
+- [x] Migration validation is part of CI.
+- [x] Security and dependency scan strategy is documented.
+
+## Phase 14: Portfolio Polish
+
+Goal: Turn the completed implementation into a strong resume and interview artifact.
+
+### Steps
+
+- [x] Add final README overview:
+    - [x] State project purpose in one paragraph.
+    - [x] Highlight banking correctness concerns.
+    - [x] List major features by phase.
+    - [x] Include architecture diagram.
+    - [x] Include ERD or schema overview.
+    - [x] Include quickstart commands.
+    - [x] Include demo script link.
+- [x] Add visual demo assets:
+    - [x] Use editable docs and Mermaid diagrams instead of tracked screenshots.
+    - [x] Document optional frontend screenshots as not applicable to backend roadmap.
+    - [x] Add sequence diagram for transfer with idempotency.
+    - [x] Add sequence diagram for reversal.
+    - [x] Add sequence diagram for outbox publish.
+    - [x] Add diagram showing transaction boundaries.
+- [x] Add sample API flow:
+    - [x] Create customer/account.
+    - [x] Fund account or seed initial balance.
+    - [x] Transfer money.
+    - [x] Replay duplicate transfer.
+    - [x] Show idempotency conflict.
+    - [x] Reverse transfer.
+    - [x] Post adjustment.
+    - [x] Run reconciliation.
+    - [x] Query audit trail.
+    - [x] Query ledger investigation endpoint.
+    - [x] Show outbox event status.
+- [x] Add incident write-ups:
+    - [x] Duplicate request investigation.
+    - [x] Overdraft race condition.
+    - [x] Failed reversal investigation.
+    - [x] Reconciliation mismatch investigation.
+    - [x] Outbox publish failure and replay.
+    - [x] Include symptoms, root cause, detection, fix, and prevention.
+- [x] Add final test and quality report:
+    - [x] Summarize test count by category.
+    - [x] Summarize integration test coverage.
+    - [x] Include coverage report link or screenshot.
+    - [x] Include CI status.
+    - [x] Include known test gaps.
+- [x] Add interview narrative:
+    - [x] Add 2-minute project explanation.
+    - [x] Add deep-dive talking points for transactions.
+    - [x] Add deep-dive talking points for idempotency.
+    - [x] Add deep-dive talking points for locking and concurrency.
+    - [x] Add deep-dive talking points for immutable ledger reversal.
+    - [x] Add deep-dive talking points for outbox and eventual publishing.
+- [x] Add resume bullet points:
+    - [x] Java and Spring Boot bullet.
+    - [x] Oracle and transaction isolation bullet.
+    - [x] Double-entry ledger bullet.
+    - [x] Idempotency and concurrency bullet.
+    - [x] Security and JWT bullet.
+    - [x] Kafka outbox bullet.
+    - [x] Testing and CI bullet.
+- [x] Add GitHub project polish:
+    - [x] Add repository description guidance.
+    - [x] Add topics/tags guidance.
+    - [x] Document license as optional follow-up.
+    - [x] Add contribution note or disclaimer.
+    - [x] Add roadmap completion summary.
+    - [x] Add known limitations and next steps.
+- [x] Add optional demo script:
+    - [x] Add scripted curl or HTTP file flow.
+    - [x] Add expected output notes.
+    - [x] Add reset instructions.
+    - [x] Keep demo under 10 minutes.
+    - [x] Link editable diagrams as fallback review assets if local services are not running.
+
+### Test Scenarios
+
+- [x] Demo flow:
+    - [x] Demo script runs from clean seed data.
+    - [x] Transfer step changes balances.
+    - [x] Idempotency replay returns original response.
+    - [x] Idempotency conflict returns structured error.
+    - [x] Reversal restores balances.
+    - [x] Adjustment changes balances through ledger engine.
+    - [x] Reconciliation detects expected mismatch.
+    - [x] Audit query finds demo operation by correlation id.
+    - [x] Investigation endpoint explains ledger transaction.
+- [x] Documentation links:
+    - [x] README links to ADRs.
+    - [x] README links to diagrams.
+    - [x] README links to API docs instructions.
+    - [x] README links to reports.
+    - [x] All referenced files exist.
+- [x] Interview artifacts:
+    - [x] 2-minute explanation is concise.
+    - [x] Resume bullets are specific and metric-oriented where possible.
+    - [x] Incident write-ups include root cause and prevention.
+    - [x] Known limitations are honest and clear.
+- [x] Repository hygiene:
+    - [x] No secrets in examples.
+    - [x] No private machine paths in public docs unless clearly local examples.
+    - [x] CI badge is correct if used.
+    - [x] Screenshot-free visual strategy is documented.
+    - [x] Demo commands match current API paths.
+
+### Acceptance Criteria
+
+- [x] Project can be explained in a 2-minute interview answer.
+- [x] README clearly states the banking/financial correctness goals.
+- [x] Demo flow proves the main business behavior.
+- [x] Incident write-up shows troubleshooting and systems thinking.
+- [x] Resume bullets highlight Java, Spring Boot, Oracle, transactions, concurrency, security, Kafka, Docker, and testing.
+- [x] Repository is easy to run, inspect, and discuss in an interview.
+- [x] Optional frontend demo, if built, is documented separately from backend roadmap.
+
+## Phase 15: Balance Recompute And Variance Detection
+
+Goal: Add an independent balance verification path so cached account balances can be audited against immutable postings.
+
+### Steps
+
+- [ ] Add a `balance` or `ledger/application/balance` package for recomputation use cases.
+- [ ] Create a read model DTO for recomputed balances:
+    - [ ] Account id.
+    - [ ] Account number.
+    - [ ] Currency code.
+    - [ ] Cached available balance minor.
+    - [ ] Cached ledger balance minor.
+    - [ ] Recomputed debit total minor.
+    - [ ] Recomputed credit total minor.
+    - [ ] Recomputed balance minor.
+    - [ ] Variance amount minor.
+    - [ ] Verification timestamp.
+- [ ] Add repository query for posting totals grouped by account:
+    - [ ] Sum debits.
+    - [ ] Sum credits.
+    - [ ] Include all financially effective posting history, including reversed originals and their corrective postings.
+    - [ ] Preserve currency code grouping.
+- [ ] Define the customer balance sign convention using the current posting implementation.
+- [ ] Recompute ledger balance from complete posting history, including original transactions marked reversed and their corrective entries; do not drop original postings merely because their parent status changed.
+- [ ] Recompute available balance from ledger balance minus active reservations after Phase 22.
+- [ ] Use a consistent Oracle snapshot or documented locking strategy for postings, reservations, and cached balances to avoid false drift during concurrent writes.
+- [ ] Represent opening balances with postings or an explicit verified opening checkpoint; do not assume synthetic cached seed balances came from postings.
+- [ ] Report discrepancies without silently overwriting balances or creating financial adjustments.
+- [ ] Define the recomputation formula for internal liability, income, clearing, and suspense accounts.
+- [ ] Implement `RecomputeAccountBalanceUseCase` for a single account.
+- [ ] Implement `SearchBalanceVarianceUseCase` for accounts with non-zero variance.
+- [ ] Add an operations API endpoint:
+    - [ ] `GET /api/v1/ops/balances/{accountId}/recomputed`.
+    - [ ] Protect it with `AUDITOR` and `OPS_ADMIN`.
+- [ ] Add an operations API endpoint:
+    - [ ] `GET /api/v1/ops/balances/variances`.
+    - [ ] Support page and size parameters.
+    - [ ] Support optional `currencyCode` filter.
+    - [ ] Support optional `minimumVarianceMinor` filter.
+    - [ ] Protect it with `AUDITOR` and `OPS_ADMIN`.
+- [ ] Add an audit event for manual balance recomputation requests.
+- [ ] Add a scheduled balance variance scan:
+    - [ ] Make it disabled by default.
+    - [ ] Configure interval through application properties.
+    - [ ] Log variance summary with correlation id or job id.
+    - [ ] Expose count and max variance metrics.
+- [ ] Document the balance verification strategy in `docs/backend/CoreBusinessLogic.md`.
+- [ ] Update `docs/operations/KnownLimitations.md` after recomputation exists.
+
+### Test Scenarios
+
+- [ ] Single account recomputation matches cached balance after a transfer.
+- [ ] Single account recomputation matches cached balance after a reversal.
+- [ ] Single account recomputation matches cached balance after an adjustment.
+- [ ] Variance search returns no rows when cached balances match postings.
+- [ ] Variance search returns an account when cached balance is intentionally changed in a test fixture.
+- [ ] Currency grouping prevents cross-currency totals from being merged.
+- [ ] Customer account debit and credit signs are recomputed correctly.
+- [ ] Internal account debit and credit signs are recomputed correctly.
+- [ ] Internal accounts are not flagged against unused zero-valued caches until an explicit internal-account cache policy is implemented.
+- [ ] Active reservations reduce recomputed availability without reducing posted balance.
+- [ ] Concurrent posting and reservation transitions do not produce false variance reports.
+- [ ] Unauthorized users cannot access balance verification endpoints.
+- [ ] Scheduled scan remains disabled unless configuration enables it.
+
+### Acceptance Criteria
+
+- [ ] Auditors can independently recompute an account balance from postings.
+- [ ] Operators can list accounts whose cached balances differ from posting-derived balances.
+- [ ] Balance variance metrics are exposed.
+- [ ] Tests prove recomputation works for transfers, reversals, and adjustments.
+- [ ] Documentation explains cached balance verification and remaining tradeoffs.
+
+## Phase 16: Operational Report Export APIs
+
+Goal: Expose selected Oracle-oriented reports through protected APIs without weakening the source-controlled SQL review model.
+
+### Steps
+
+- [ ] Create a `reporting/api` package for report controllers.
+- [ ] Create a `reporting/application` package for report use cases.
+- [ ] Create report response DTOs for:
+    - [ ] Daily trial balance.
+    - [ ] Account statement summary.
+    - [ ] Reconciliation mismatch report.
+    - [ ] Suspense account aging report.
+    - [ ] Ledger activity report.
+    - [ ] Top failed transfer reasons.
+- [ ] Add a report catalog endpoint:
+    - [ ] `GET /api/v1/ops/reports`.
+    - [ ] Return report id, display name, description, parameters, and supported formats.
+    - [ ] Protect it with `AUDITOR` and `OPS_ADMIN`.
+- [ ] Add JSON report endpoints:
+    - [ ] `GET /api/v1/ops/reports/daily-trial-balance`.
+    - [ ] `GET /api/v1/ops/reports/account-statement-summary`.
+    - [ ] `GET /api/v1/ops/reports/reconciliation-mismatches`.
+    - [ ] `GET /api/v1/ops/reports/suspense-aging`.
+    - [ ] `GET /api/v1/ops/reports/ledger-activity`.
+    - [ ] `GET /api/v1/ops/reports/top-failed-transfer-reasons`.
+- [ ] Add request parameter validation:
+    - [ ] Required business date where applicable.
+    - [ ] Optional account id where applicable.
+    - [ ] Optional date range where applicable.
+    - [ ] Maximum date range guardrail.
+    - [ ] Page and size guardrails for large reports.
+- [ ] Execute reports with `NamedParameterJdbcTemplate` or a similarly structured API.
+- [ ] Keep SQL files as the reviewed source of report logic.
+- [ ] Add a small SQL loader utility that reads report SQL from classpath resources.
+- [ ] Add CSV export support for one report first.
+- [ ] Add consistent `Content-Disposition` filenames for CSV downloads.
+- [ ] Add audit events for report export requests.
+- [ ] Document report endpoints in `docs/backend/API.md`.
+- [ ] Update `reports/README.md` with API usage examples.
+
+### Test Scenarios
+
+- [ ] Report catalog returns all supported reports.
+- [ ] Trial balance report returns expected totals for seeded or fixture data.
+- [ ] Account statement summary filters by account.
+- [ ] Reconciliation mismatch report returns mismatch rows.
+- [ ] Suspense aging report excludes non-suspense accounts.
+- [ ] Ledger activity report applies date range filters.
+- [ ] Top failed transfer reasons returns grouped counts.
+- [ ] Invalid date ranges return structured validation errors.
+- [ ] Oversized date ranges are rejected.
+- [ ] Unauthorized users cannot access report endpoints.
+- [ ] CSV export returns correct content type and filename.
+
+### Acceptance Criteria
+
+- [ ] Auditors can run selected reports from the API.
+- [ ] Report SQL remains source-controlled and reviewable.
+- [ ] JSON and at least one CSV export path are covered by tests.
+- [ ] Report requests are audited.
+- [ ] API documentation includes report parameters and example responses.
+
+## Phase 17: Outbox Event Contract Hardening
+
+Goal: Make published event payloads stable, versioned, and reviewable before introducing external consumers.
+
+### Steps
+
+- [ ] Create `docs/events/` for event contract documentation.
+- [ ] Document common outbox envelope fields:
+    - [ ] Event id.
+    - [ ] Event type.
+    - [ ] Schema version.
+    - [ ] Aggregate type.
+    - [ ] Aggregate id.
+    - [ ] Occurred at.
+    - [ ] Correlation id.
+    - [ ] Payload.
+- [ ] Add JSON Schema files for each published event:
+    - [ ] `LedgerTransactionPosted`.
+    - [ ] `LedgerTransactionReversed`.
+    - [ ] `AccountBalanceChanged`.
+    - [ ] `AdjustmentPosted`.
+    - [ ] `ReconciliationMismatchFound`.
+- [ ] Add a schema version constant per event type.
+- [ ] Add tests that serialize each event payload and validate it against its JSON Schema.
+- [ ] Add tests that reject missing required envelope fields.
+- [ ] Add tests that reject unknown schema versions for requeue or replay where applicable.
+- [ ] Add contract examples under `docs/events/examples/`.
+- [ ] Add topic naming documentation for local Kafka topics.
+- [ ] Add payload compatibility rules:
+    - [ ] Additive fields are allowed.
+    - [ ] Required field removal needs a new schema version.
+    - [ ] Type changes need a new schema version.
+    - [ ] Semantic changes need ADR documentation.
+- [ ] Add an ADR for event versioning and compatibility.
+- [ ] Update outbox publisher tests to assert event key selection.
+- [ ] Update outbox publisher tests to assert destination topic selection.
+
+### Test Scenarios
+
+- [ ] Every current outbox event type has a schema file.
+- [ ] Every current outbox event type has a serialized example.
+- [ ] Event examples validate against schemas.
+- [ ] Runtime serialization output validates against schemas.
+- [ ] Unknown event schema versions are handled predictably.
+- [ ] Event key selection is deterministic.
+- [ ] Topic selection matches documented destination rules.
+- [ ] Requeue preserves event type and schema version.
+
+### Acceptance Criteria
+
+- [ ] Event consumers can review stable event contracts without reading Java code.
+- [ ] Tests fail if a payload breaks its documented schema.
+- [ ] Schema versioning rules are documented.
+- [ ] Outbox publishing behavior remains deterministic.
+
+## Phase 18: Approval Workflow For High-Risk Operations
+
+Goal: Add a two-step operational control for actions that should not execute immediately after a single privileged request.
+
+### Steps
+
+- [ ] Create a `approval` package with API, application, domain, and persistence layers.
+- [ ] Add a Flyway migration for approval requests:
+    - [ ] Approval request id.
+    - [ ] Operation type.
+    - [ ] Target entity type.
+    - [ ] Target entity id.
+    - [ ] Requested by actor id.
+    - [ ] Requested by role.
+    - [ ] Reason.
+    - [ ] Status.
+    - [ ] Approved by actor id.
+    - [ ] Rejected by actor id.
+    - [ ] Decision reason.
+    - [ ] Created at.
+    - [ ] Decided at.
+    - [ ] Version.
+- [ ] Add approval statuses:
+    - [ ] `PENDING`.
+    - [ ] `APPROVED`.
+    - [ ] `REJECTED`.
+    - [ ] `CANCELLED`.
+    - [ ] `EXECUTED`.
+    - [ ] `EXPIRED`.
+- [ ] Add approval operation types:
+    - [ ] `OUTBOX_REQUEUE`.
+    - [ ] `HIGH_VALUE_ADJUSTMENT`.
+    - [ ] `HIGH_VALUE_REVERSAL`.
+- [ ] Implement create approval request use case.
+- [ ] Implement approve approval request use case.
+- [ ] Implement reject approval request use case.
+- [ ] Implement cancel own pending approval request use case.
+- [ ] Add rule that requester cannot approve their own request.
+- [ ] Add rule that only privileged roles can approve sensitive operations.
+- [ ] Add expiration policy for stale pending requests.
+- [ ] Deliver adjustment approval as the first vertical: request, approve/reject, execute, inspect.
+- [ ] Persist immutable proposed posting lines, currency, amount, reason, and a payload hash/version; approval applies only to that exact request.
+- [ ] Enforce different requester/approver identities and authorization again at execution, including application entry points used outside HTTP.
+- [ ] Atomically commit the adjustment, approval execution state, audit, and outbox; serialize competing execution attempts and reuse a durable execution identity.
+- [ ] Disable direct adjustment execution for operations covered by the approval policy.
+- [ ] Integrate approval with outbox requeue:
+    - [ ] Create approval request instead of immediate requeue when configured.
+    - [ ] Execute requeue only after approval.
+    - [ ] Keep existing immediate requeue path disabled by default or limited to service role.
+- [ ] Add audit events for approval requested, approved, rejected, cancelled, expired, and executed.
+- [ ] Add operations API endpoints:
+    - [ ] `POST /api/v1/ops/approvals`.
+    - [ ] `GET /api/v1/ops/approvals`.
+    - [ ] `GET /api/v1/ops/approvals/{approvalId}`.
+    - [ ] `POST /api/v1/ops/approvals/{approvalId}/approve`.
+    - [ ] `POST /api/v1/ops/approvals/{approvalId}/reject`.
+    - [ ] `POST /api/v1/ops/approvals/{approvalId}/cancel`.
+    - [ ] `POST /api/v1/ops/approvals/{approvalId}/execute`.
+- [ ] Document the approval workflow in `docs/backend/CoreBusinessLogic.md`.
+
+### Test Scenarios
+
+- [ ] Ops admin can create an outbox requeue approval request.
+- [ ] Auditor can view approval requests if allowed by policy.
+- [ ] Requester cannot approve their own request.
+- [ ] Different ops admin can approve a pending request.
+- [ ] Rejected request cannot be executed.
+- [ ] Cancelled request cannot be approved.
+- [ ] Expired request cannot be approved.
+- [ ] Approved outbox requeue request executes exactly once.
+- [ ] Duplicate execute attempts are rejected or return the prior result.
+- [ ] Approval decisions write audit events.
+- [ ] Changing approved posting lines requires a new request and approval.
+- [ ] Concurrent adjustment execution creates one financial result.
+- [ ] Posting failure rolls back approval execution; retry cannot duplicate a committed adjustment.
+- [ ] Direct adjustment APIs cannot bypass the configured approval policy.
+- [ ] Unauthorized users cannot create or decide approvals.
+
+### Acceptance Criteria
+
+- [ ] High-risk outbox requeue can require approval before execution.
+- [ ] Approval requests are auditable and queryable.
+- [ ] Self-approval is prevented.
+- [ ] Tests cover approval state transitions and authorization.
+
+## Phase 19: Performance And Concurrency Benchmarks
+
+Goal: Add repeatable performance checks for transfer concurrency, lock behavior, and correctness under load.
+
+### Steps
+
+- [ ] Create a `src/test/java/.../performance` test package.
+- [ ] Add a disabled-by-default performance test profile or JUnit tag.
+- [ ] Add a command documented for running performance tests locally.
+- [ ] Build a fixture that creates:
+    - [ ] One funded source account.
+    - [ ] Multiple destination accounts.
+    - [ ] Service or customer principal context.
+    - [ ] Unique idempotency keys per request.
+- [ ] Add concurrent successful transfer benchmark.
+- [ ] Add concurrent overdraft rejection benchmark.
+- [ ] Add mixed duplicate idempotency replay benchmark.
+- [ ] Measure and log:
+    - [ ] Total request count.
+    - [ ] Success count.
+    - [ ] Rejection count.
+    - [ ] Duplicate replay count.
+    - [ ] Average latency.
+    - [ ] p95 latency.
+    - [ ] p99 latency.
+    - [ ] Final balance.
+    - [ ] Ledger posting count.
+- [ ] Add an assertion that final balances match expected totals.
+- [ ] Add an assertion that all posted journal entries remain balanced.
+- [ ] Add an assertion that duplicate idempotency keys do not create duplicate postings.
+- [ ] Document expected local machine variability.
+- [ ] Keep performance tests outside the default CI path.
+
+### Test Scenarios
+
+- [ ] Concurrent transfers from the same source account preserve balances.
+- [ ] Concurrent overdrafts reject without negative cached balances.
+- [ ] Concurrent idempotency replays return stable prior results.
+- [ ] Benchmark output includes latency and correctness summary.
+- [ ] Performance tests can be run with one explicit Maven command.
+- [ ] Default `./mvnw test` does not run long benchmarks.
+
+### Acceptance Criteria
+
+- [ ] The project has a repeatable transfer stress test.
+- [ ] Benchmark tests prove correctness, not only speed.
+- [ ] Results are documented enough for interview discussion.
+- [ ] Long-running tests are opt-in.
+
+## Phase 20: Gradual Quality Gate Enforcement
+
+Goal: Convert documented quality intentions into enforceable gates without creating noisy CI failures.
+
+### Steps
+
+- [ ] Capture current JaCoCo baseline from `./mvnw verify`.
+- [ ] Exclude generated/configuration classes from coverage thresholds where justified.
+- [ ] Add package-level coverage thresholds for core business packages first:
+    - [ ] `ledger`.
+    - [ ] `transfer`.
+    - [ ] `reversal`.
+    - [ ] `adjustment`.
+    - [ ] `reconciliation`.
+    - [ ] `outbox`.
+    - [ ] `security`.
+- [ ] Add a global minimum coverage threshold after package thresholds are stable.
+- [ ] Document how to inspect coverage reports locally.
+- [ ] Choose a formatter profile.
+- [ ] Add formatter plugin configuration.
+- [ ] Add a formatter check command.
+- [ ] Add formatter check to CI.
+- [ ] Choose a Checkstyle or equivalent static style profile.
+- [ ] Add style rules focused on maintainability:
+    - [ ] Avoid wildcard imports.
+    - [ ] Limit method length where practical.
+    - [ ] Require braces.
+    - [ ] Keep line length reasonable.
+    - [ ] Avoid hidden tab/space churn.
+- [ ] Add static style check to CI after local code is formatted.
+- [ ] Update `docs/operations/QualityReport.md` with enforced gates.
+
+### Test Scenarios
+
+- [ ] Coverage threshold fails when core package coverage drops below the configured floor.
+- [ ] Formatter check fails on intentionally unformatted code in a local dry run.
+- [ ] Style check fails on a known rule violation in a local dry run.
+- [ ] CI command and local command use the same checks.
+- [ ] Existing tests still pass after formatting.
+
+### Acceptance Criteria
+
+- [ ] Coverage thresholds are enforced for high-value backend packages.
+- [ ] Formatter checks are automated.
+- [ ] Static style checks are automated.
+- [ ] Quality report reflects the enforced gates.
+
+## Phase 21: Observability And Operational Metrics
+
+Goal: Improve runtime visibility into financial workflows, reconciliation, outbox publishing, and balance verification.
+
+### Steps
+
+- [ ] Add or standardize Micrometer metrics for transfer workflows:
+    - [ ] Transfer requests total.
+    - [ ] Transfer successes total.
+    - [ ] Transfer rejections total by reason.
+    - [ ] Transfer idempotency replays total.
+    - [ ] Transfer latency timer.
+- [ ] Add metrics for ledger posting:
+    - [ ] Ledger transactions posted total.
+    - [ ] Journal entries posted total.
+    - [ ] Posting failures total by reason.
+- [ ] Add metrics for reversal and adjustment workflows:
+    - [ ] Reversals requested total.
+    - [ ] Reversals completed total.
+    - [ ] Duplicate reversal rejections total.
+    - [ ] Adjustments posted total.
+- [ ] Add metrics for reconciliation:
+    - [ ] Settlement batches imported total.
+    - [ ] Reconciliation matches total.
+    - [ ] Reconciliation mismatches total by type.
+    - [ ] Reconciliation processing latency timer.
+- [ ] Add metrics for outbox publishing:
+    - [ ] Pending outbox events gauge.
+    - [ ] Published outbox events total.
+    - [ ] Failed outbox publishes total.
+    - [ ] Dead-letter outbox events gauge.
+    - [ ] Outbox lag gauge.
+- [ ] Add metrics for balance verification:
+    - [ ] Balance variance accounts gauge.
+    - [ ] Max balance variance gauge.
+    - [ ] Balance verification run latency timer.
+- [ ] Add structured log fields for financial workflows:
+    - [ ] Correlation id.
+    - [ ] Actor id.
+    - [ ] Actor role.
+    - [ ] Operation.
+    - [ ] Entity type.
+    - [ ] Entity id.
+    - [ ] Outcome.
+- [ ] Add actuator documentation for metrics endpoints.
+- [ ] Add local dashboard notes or sample metric queries in docs.
+- [ ] Ensure logs do not include secrets, bearer tokens, or sensitive full payloads.
+
+### Test Scenarios
+
+- [ ] Transfer success increments success counter.
+- [ ] Transfer rejection increments rejection counter with reason tag.
+- [ ] Idempotency replay increments replay counter.
+- [ ] Reversal completion increments reversal counter.
+- [ ] Adjustment completion increments adjustment counter.
+- [ ] Reconciliation mismatch increments mismatch counter.
+- [ ] Outbox publish success and failure update metrics.
+- [ ] Balance variance scan updates gauges.
+- [ ] Structured logs include correlation id for a financial request.
+- [ ] Structured logs omit authorization headers and secrets.
+
+### Acceptance Criteria
+
+- [ ] Actuator exposes meaningful business and operational metrics.
+- [ ] Financial workflows emit structured logs with correlation context.
+- [ ] Metrics cover transfers, ledger postings, reversals, adjustments, reconciliation, outbox, and balance verification.
+- [ ] Tests verify key metric updates.
+
+## Phase 22: Funds Reservations
+
+Goal: Reserve spendable customer funds, then capture, release, or expire the reservation without spending the same funds twice.
+
+Status: selected next; preparation pending. This phase extends BankingLedger itself.
+
+### Scope And Invariants
+
+- [ ] Define one account, currency, positive minor-unit amount, fixed destination, expiry instant, and authenticated owner for each reservation.
+- [ ] Support `ACTIVE -> CAPTURED`, `ACTIVE -> RELEASED`, and `ACTIVE -> EXPIRED`; terminal states cannot perform another financial transition.
+- [ ] For the initial customer model, maintain `available = ledger - sum(active reservation amounts)` and nonnegative availability.
+- [ ] Creation changes availability only. Release/expiry restore availability only. Capture creates balanced postings and consumes the hold atomically without subtracting its amount twice from availability.
+- [ ] Define expiry eligibility at an exact clock boundary, frozen/closed account behavior, and destination validation. Persisted ACTIVE holds remain deducted until an atomic terminal transition; elapsed time alone must not silently change cached availability.
+- [ ] Use full capture only initially. Partial capture, reservation amount edits, FX, external card networks, and lending are deferred.
+
+### Implementation Increments
+
+- [ ] RES00: Explain current transfer/balance behavior; produce a transition table, example timeline, invariants, and affected write-path inventory before implementation.
+- [ ] RES01: Add an Oracle Flyway migration and reservation domain model, constraints, expiry index, and links to the resulting ledger transaction. Add ownership-protected create/get/release APIs with request validation and scoped idempotency.
+- [ ] RES02: Implement full capture through the shared posting engine. Define reservation/account lock ordering across every participating write path, including transfers, reversals, and adjustments; do not assume the generic posting path takes transfer locks.
+- [ ] RES03: Implement expiry with an injected clock and a bounded restart-safe worker. API transitions must enforce expiry even when the worker is delayed. Coordinate multiple workers and concurrent API requests through Oracle state/locks.
+- [ ] RES04: Add atomic audit/outbox events for reservation transitions and availability changes; preserve event identity for duplicate delivery and queryable history.
+- [ ] RES05: Complete Oracle race/rollback tests, API documentation, an HTTP demo, an invariant-to-test map, and an unaided ownership explanation.
+
+### Test Scenarios
+
+- [ ] Start at ledger/available 1,000; reserve 300 -> 1,000/700; spending 800 fails; full capture -> 700/700 on the source and one balanced journal.
+- [ ] Release or expiry restores source availability to 1,000 with no financial posting for the hold itself.
+- [ ] Reservation versus transfer, and two reservations exceeding funds, cannot overspend.
+- [ ] Capture versus release, capture versus expiry, and two captures have one winning terminal transition.
+- [ ] Capture works when all spendable money was reserved; the debit policy does not reject or double-deduct the captured hold.
+- [ ] Same-key/same-payload retries replay; changed payload conflicts; distinct keys cannot capture the same reservation twice.
+- [ ] Failure during posting, audit, or outbox persistence rolls back balances, hold state, and financial writes together.
+- [ ] Expiry boundary, worker restart, multiple workers, frozen accounts, currency mismatch, and cross-owner access have explicit expected results.
+- [ ] Ordinary transfers, reversals, and adjustments preserve reservation-aware availability.
+
+### Acceptance Criteria
+
+- [ ] All invariants have meaningful Oracle-backed evidence and existing money movement regressions pass.
+- [ ] Demo includes a rejected overspend and a duplicate capture with unchanged posting count.
+- [ ] Document the exact tested revision, commands, outcomes, and remaining limits; do not describe synthetic internal capture as a live card integration.
+
+## Phase 23: Scheduled Transfers
+
+Goal: Execute a customer-authorized future internal payment safely across retries and worker restarts.
+
+### Steps
+
+- [ ] Begin with one-time transfers: owner, source/destination, currency, amount, due instant, durable execution identity, status, and attempt history.
+- [ ] Define timezone conversion, cancellation cutoff, account authorization/status revalidation, insufficient-funds outcome, and bounded retry policy.
+- [ ] Reserve no funds at scheduling time in the first version; validate funds at execution and explain that scheduling does not guarantee payment.
+- [ ] Use a bounded worker with durable claim/recovery semantics and the existing transfer application flow; preserve one business identity across all retry attempts.
+- [ ] Expose create/get/cancel and execution history; emit audit/outbox records. Defer recurring schedules until one-time execution is proven.
+
+### Tests And Acceptance
+
+- [ ] Competing workers and crash recovery produce at most one committed transfer per schedule.
+- [ ] Cancellation versus execution has a defined atomic winner.
+- [ ] Insufficient funds, frozen accounts, changed authorization, due-time boundaries, and transaction rollback are tested on Oracle.
+- [ ] A restart demo shows a committed payment is not paid again; durable status points to its transfer.
+
+## Phase 24: Installment Loan Sandbox
+
+Goal: Model principal debt, disbursement, and repayment as an auditable lending vertical over the ledger.
+
+### Steps
+
+- [ ] First document the accounting perspective, receivable/control accounts, normal balance directions, and customer/internal balance policy. Current internal caches are not maintained; do not equate them with outstanding debt.
+- [ ] Define single-currency principal-only loan terms, fixed installment dates, deterministic minor-unit remainder allocation, and lifecycle before adding interest.
+- [ ] Add Oracle entities/constraints for loan agreements, installments, disbursement links, repayment allocations, and corrective links.
+- [ ] Implement authenticated create/approve/disburse/query/repay workflows with one disbursement per loan and durable repayment identities.
+- [ ] Allocate partial repayments by an explicit rule; reject overpayment initially; expose outstanding principal and overdue installments without silently changing the agreement.
+- [ ] Atomically persist allocations, balanced postings, loan state, audit, and outbox; derive or reconcile debt against authoritative financial history.
+- [ ] Define linked repayment corrections and closure behavior. Keep schedules as obligations, not posted money.
+- [ ] Defer interest, fees, penalties, underwriting, write-offs, refinancing, external collections, and real-money lending to separately designed increments.
+
+### Tests And Acceptance
+
+- [ ] Installment principal sums exactly to disbursed principal, including amounts not evenly divisible by installment count.
+- [ ] Concurrent duplicate disbursement/repayment, partial repayment, overpayment, correction, final repayment, and rollback are covered on Oracle.
+- [ ] Loan principal and allocated repayments reconcile to the ledger under the documented accounting model.
+- [ ] Demo shows disbursement, a repayment retry, remaining debt, and a linked correction using synthetic accounts.
+
+## Phase 25: BNPL Sandbox
+
+Goal: Extend the loan lifecycle with a simulated merchant purchase and four customer installments.
+
+Dependency: Phase 24 debt and repayment invariants must be proven first. Scheduling may reuse Phase 23; reservation reuse is optional and requires explicit business semantics.
+
+### Steps
+
+- [ ] Define merchant/order identity, purchase agreement, customer obligation, merchant funding, and the upfront-payment policy.
+- [ ] Reuse loan servicing with a fixed four-part schedule and deterministic rounding; scheduled transfers alone do not represent debt.
+- [ ] Atomically link purchase, merchant payment, receivable, and installment agreement in the local Oracle boundary.
+- [ ] Add duplicate-order protection, retries, status/history APIs, audit, and outbox records.
+- [ ] Define cancellation before funding and full refunds after funding, including already-paid installments and one linked compensating financial flow.
+- [ ] Defer partial refunds, merchant fees, credit scoring, external settlement, disputes, and collections. Any later external integration needs an explicit recovery protocol beyond a local transaction.
+
+### Tests And Acceptance
+
+- [ ] Duplicate checkout cannot pay a merchant twice or create two debts.
+- [ ] Merchant funding failure rolls back local financial and agreement state.
+- [ ] Repayments, full refunds before/after a repayment, rounding, and concurrent retries reconcile on Oracle.
+- [ ] Demo traces one purchase from merchant funding through installments and refund, with no claim of a live BNPL service.
+
+## Suggested Build Order
+
+The original foundation sequence is retained below. For new work, follow **Current Feature Priorities** above: Phase 22 first, then 15, the adjustment vertical of 18, 23, 24, and 25. Phases 16–21 can be interleaved when required by a feature.
+
+1. Foundation
+2. Schema and domain model
+3. Account service
+4. Ledger posting engine
+5. Transfer API
+6. Concurrency tests
+7. Reversal flow
+8. Security
+9. Audit APIs
+10. Outbox and Kafka
+11. Reconciliation
+12. API documentation and developer experience
+13. CI/CD and quality gates
+14. Portfolio polish
+15. Balance recompute and variance detection
+16. Operational report export APIs
+17. Outbox event contract hardening
+18. Approval workflow for high-risk operations
+19. Performance and concurrency benchmarks
+20. Gradual quality gate enforcement
+21. Observability and operational metrics
+22. Funds reservations — next selected feature
+23. Scheduled transfers
+24. Installment loan sandbox
+25. BNPL sandbox
+
+## Definition Of Done For Each Phase
+
+- [ ] Code is implemented.
+- [ ] Tests are added for meaningful behavior.
+- [ ] `./mvnw test` passes.
+- [ ] The application starts locally.
+- [ ] Relevant README or docs are updated.
+- [ ] No secrets are committed.
+- [ ] The implementation follows the banking correctness rules in `docs/backend/Project.md`.

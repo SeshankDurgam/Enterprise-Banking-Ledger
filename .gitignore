@@ -1,0 +1,12 @@
+# Local SDK selection
+/.sdkmanrc
+
+# IDE metadata
+.idea/
+*.iml
+
+# Local codebase-memory index
+.codebase-memory/
+
+# macOS Finder metadata
+.DS_Store
